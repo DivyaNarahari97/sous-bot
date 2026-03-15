@@ -288,7 +288,11 @@ class TestVisionRoutes:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
+        import sous_bot.vision.routes as routes_mod
         from sous_bot.vision.routes import router
+
+        # Reset shared state between tests
+        routes_mod._tracker = InventoryTracker()
 
         app = FastAPI()
         app.include_router(router)
