@@ -810,47 +810,113 @@ class GroceryStoreEnv:
         self.renderer.update_scene(self.data)
         return self.renderer.render()
 
-    def render_robot_view(self, width: int = 640, height: int = 480) -> np.ndarray | None:
-        """Render from the robot's perspective — what it 'sees' looking forward.
-
-        Camera is placed at head height, looking in the robot's facing direction.
-        Returns RGB numpy array (JPEG-encodable).
-        """
-        if self.model is None or self.data is None:
-            return None
+    def _setup_robot_camera(self, width: int = 640, height: int = 480) -> tuple[mujoco.Renderer, mujoco.MjvCamera]:
+        """Set up a first-person camera from the robot's head. Returns (renderer, camera)."""
         import math
 
         renderer = mujoco.Renderer(self.model, height=height, width=width)
         camera = mujoco.MjvCamera()
 
-        # Robot position and heading
-        robot_pos = self.get_robot_position()
-        # Extract yaw from quaternion qpos[3:7]
         w, x, y, z = self.data.qpos[3], self.data.qpos[4], self.data.qpos[5], self.data.qpos[6]
         yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
-        # True first-person: camera AT robot's eyes
         torso_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         torso_pos = self.data.xpos[torso_id]
 
-        # Eye: top of torso + 0.6m up, 0.3m forward past body geometry
         eye_x = torso_pos[0] + 0.3 * math.cos(yaw)
         eye_y = torso_pos[1] + 0.3 * math.sin(yaw)
         eye_z = torso_pos[2] + 0.6
 
-        # Tiny distance = camera sits right at the eye position
         camera.lookat[0] = eye_x + 0.01 * math.cos(yaw)
         camera.lookat[1] = eye_y + 0.01 * math.sin(yaw)
-        camera.lookat[2] = eye_z - 0.05  # Slight downward toward shelves
-
+        camera.lookat[2] = eye_z - 0.05
         camera.distance = 0.01
-        camera.azimuth = math.degrees(yaw)  # Face forward
+        camera.azimuth = math.degrees(yaw)
         camera.elevation = -10
 
+        return renderer, camera
+
+    def render_robot_view(self, width: int = 640, height: int = 480) -> np.ndarray | None:
+        """Render from the robot's perspective. Returns RGB numpy array."""
+        if self.model is None or self.data is None:
+            return None
+        renderer, camera = self._setup_robot_camera(width, height)
         renderer.update_scene(self.data, camera)
         frame = renderer.render()
         renderer.close()
         return frame
+
+    def render_robot_view_depth(self, width: int = 640, height: int = 480) -> np.ndarray | None:
+        """Render depth buffer from the robot's perspective. Returns float32 array."""
+        if self.model is None or self.data is None:
+            return None
+        renderer, camera = self._setup_robot_camera(width, height)
+        renderer.update_scene(self.data, camera)
+        renderer.enable_depth_rendering()
+        depth = renderer.render().copy()
+        renderer.disable_depth_rendering()
+        renderer.close()
+        return depth
+
+    def render_robot_view_rgbd(self, width: int = 640, height: int = 480) -> tuple[np.ndarray, np.ndarray] | None:
+        """Render both RGB and depth from robot's perspective. Returns (rgb, depth)."""
+        if self.model is None or self.data is None:
+            return None
+        renderer, camera = self._setup_robot_camera(width, height)
+        renderer.update_scene(self.data, camera)
+        rgb = renderer.render().copy()
+        renderer.enable_depth_rendering()
+        depth = renderer.render().copy()
+        renderer.disable_depth_rendering()
+        renderer.close()
+        return rgb, depth
+
+    def pixel_to_world(self, px: int, py: int, depth: np.ndarray,
+                       width: int = 640, height: int = 480) -> np.ndarray | None:
+        """Convert pixel coordinates + depth buffer to 3D world position.
+
+        MuJoCo's depth renderer returns metric distances directly.
+        Uses camera intrinsics to unproject (px, py, depth) → [x, y, z].
+        """
+        import math
+
+        z_metric = float(depth[py, px])
+        if z_metric > 100.0:
+            return None  # Background — no object at this pixel
+
+        # Camera intrinsics — MuJoCo default fovy is 45 degrees
+        fovy = math.radians(self.model.vis.global_.fovy)
+        f_y = (height / 2.0) / math.tan(fovy / 2.0)
+        f_x = f_y  # Square pixels
+
+        # Pixel to camera-frame 3D point
+        cx, cy = width / 2.0, height / 2.0
+        x_cam = (px - cx) / f_x * z_metric
+        y_cam = -(py - cy) / f_y * z_metric  # Flip Y (image Y is down)
+
+        # Camera-to-world transform: use same camera setup as rendering
+        w_q, x_q, y_q, z_q = self.data.qpos[3], self.data.qpos[4], self.data.qpos[5], self.data.qpos[6]
+        yaw = math.atan2(2 * (w_q * z_q + x_q * y_q), 1 - 2 * (y_q * y_q + z_q * z_q))
+
+        torso_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+        torso_pos = self.data.xpos[torso_id]
+        eye = np.array([
+            torso_pos[0] + 0.3 * math.cos(yaw),
+            torso_pos[1] + 0.3 * math.sin(yaw),
+            torso_pos[2] + 0.6,
+        ])
+
+        # Camera axes in world frame
+        elev = math.radians(-10)
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+        cos_e, sin_e = math.cos(elev), math.sin(elev)
+
+        right = np.array([-sin_y, cos_y, 0.0])
+        up = np.array([-cos_y * sin_e, -sin_y * sin_e, cos_e])
+        forward = np.array([cos_y * cos_e, sin_y * cos_e, sin_e])
+
+        world_point = eye + x_cam * right + y_cam * up + z_metric * forward
+        return world_point
 
     def render_robot_view_jpeg(self, width: int = 640, height: int = 480) -> bytes | None:
         """Render robot's view as JPEG bytes (ready for VLM)."""

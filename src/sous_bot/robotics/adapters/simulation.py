@@ -11,7 +11,7 @@ import math
 
 import numpy as np
 
-from sim.grocery_env import GroceryStoreEnv, AISLE_POSITIONS, CART_POSITION
+from sim.grocery_env import GroceryStoreEnv, AISLE_POSITIONS, CART_POSITION, STORE_ITEMS
 
 from .base import (
     ActionResult,
@@ -91,10 +91,26 @@ class SimulationAdapter(RobotAdapter):
         )
 
     async def locate_item(self, item_name: str, parameters: dict | None = None) -> ActionResult:
-        """Locate an item in the store (lookup only — VLM scan happens at shelf)."""
+        """Locate an item by scanning shelves with VLM, or fall back to store lookup."""
         action = RobotAction(action="locate", target=item_name, parameters=parameters or {})
         self._current_action = action
 
+        # --- Vision-based search: walk aisle-by-aisle, scan shelves ---
+        if self._use_vision:
+            result = await self._vision_search_aisles(item_name)
+            if result is not None:
+                aisle, world_pos = result
+                self._current_action = None
+                return ActionResult(
+                    action=action, status=ActionStatus.COMPLETED,
+                    message=f"VLM found {item_name} in {aisle} aisle",
+                    data={"aisle": aisle, "shelf": 0,
+                          "position": world_pos.tolist(),
+                          "vision_detected": True},
+                )
+            logger.info("VLM search failed for '%s' — falling back to store lookup", item_name)
+
+        # --- Fallback: hardcoded store dictionary ---
         item_info = self.env.get_item_info(item_name)
         if item_info is None:
             return ActionResult(action=action, status=ActionStatus.FAILED,
@@ -104,62 +120,213 @@ class SimulationAdapter(RobotAdapter):
         self._current_action = None
         return ActionResult(
             action=action, status=ActionStatus.COMPLETED,
-            message=f"Located {item_name} in {item_info['aisle']} aisle",
+            message=f"Located {item_name} in {item_info['aisle']} aisle (store lookup)",
             data={"aisle": item_info["aisle"], "shelf": item_info["shelf"],
                   "position": item_pos.tolist() if item_pos is not None else None},
         )
 
-    async def _vision_locate(self, item_name: str) -> bool:
-        """Use Qwen2.5-VL to visually confirm an item on the shelf."""
+    async def _vision_search_aisles(self, item_name: str) -> tuple[str, np.ndarray] | None:
+        """Walk aisle-by-aisle, scan each shelf with VLM to find an item.
+
+        Returns (aisle_name, world_position) or None if not found.
+        """
         try:
-            # Lazy-load the detector
             if self._detector is None:
                 from sous_bot.vision.detector import IngredientDetector
                 self._detector = IngredientDetector()
                 logger.info("VLM vision detector initialized (Qwen2.5-VL)")
 
-            # Capture what the robot sees
-            image_bytes = self.env.render_robot_view_jpeg()
-            if image_bytes is None:
-                logger.warning("Could not capture robot view")
-                return False
+            aisle_names = list(AISLE_POSITIONS.keys())
+            cam_w, cam_h = 640, 480
 
-            # Ask VLM: "Do you see this item on the shelf?"
-            logger.info("VLM scanning shelf for '%s'...", item_name)
+            for aisle_name in aisle_names:
+                ax, ay = AISLE_POSITIONS[aisle_name]
+
+                # Walk to this aisle
+                logger.info("VLM search: walking to %s aisle...", aisle_name)
+                await self._move_to(ax, ay)
+
+                # Face the left shelf (y+) — most items are there
+                self.env.set_robot_heading(math.pi / 2)
+                for _ in range(10):
+                    self.env.step(SIM_STEPS_PER_TICK)
+                    await asyncio.sleep(FRAME_DELAY)
+
+                # Scan left shelf
+                found = await self._scan_shelf_for_item(
+                    item_name, aisle_name, "left", cam_w, cam_h,
+                )
+                if found is not None:
+                    return (aisle_name, found)
+
+                # Turn to face right shelf (y-)
+                self.env.set_robot_heading(-math.pi / 2)
+                for _ in range(10):
+                    self.env.step(SIM_STEPS_PER_TICK)
+                    await asyncio.sleep(FRAME_DELAY)
+
+                # Scan right shelf
+                found = await self._scan_shelf_for_item(
+                    item_name, aisle_name, "right", cam_w, cam_h,
+                )
+                if found is not None:
+                    return (aisle_name, found)
+
+            logger.info("VLM search: '%s' not found in any aisle", item_name)
+            return None
+
+        except Exception as e:
+            logger.warning("VLM aisle search failed: %s", e)
+            return None
+
+    async def _scan_shelf_for_item(
+        self, item_name: str, aisle_name: str, side: str,
+        cam_w: int = 640, cam_h: int = 480,
+    ) -> np.ndarray | None:
+        """Scan a single shelf with VLM. Returns 3D world position or None."""
+        import cv2
+
+        rgbd = self.env.render_robot_view_rgbd(cam_w, cam_h)
+        if rgbd is None:
+            return None
+        rgb, depth = rgbd
+
+        # First: ask VLM what it sees on this shelf (general scan)
+        _, jpeg = cv2.imencode(".jpg", rgb[:, :, ::-1])
+        image_bytes = jpeg.tobytes()
+
+        logger.info("VLM scanning %s shelf in %s aisle...", side, aisle_name)
+        scan_result = await asyncio.to_thread(
+            self._detector.detect_from_bytes, image_bytes,
+        )
+
+        # Check if any detected ingredient matches our target
+        detected_names = [ing.name for ing in scan_result.ingredients]
+        logger.info("VLM sees on %s %s shelf: %s", aisle_name, side, detected_names)
+
+        # Fuzzy match: check if item_name is in or contains any detected name
+        match_found = False
+        for detected in detected_names:
+            if (item_name.lower() in detected.lower()
+                    or detected.lower() in item_name.lower()):
+                match_found = True
+                break
+
+        if not match_found:
+            return None
+
+        # Item spotted! Now get precise pixel location
+        logger.info("VLM spotted '%s' on %s %s shelf! Getting pixel coords...",
+                     item_name, aisle_name, side)
+        locate_result = await asyncio.to_thread(
+            self._detector.locate_item_on_shelf, image_bytes, item_name,
+            cam_w, cam_h,
+        )
+
+        if not locate_result.found or locate_result.confidence < 0.4:
+            logger.info("VLM couldn't pinpoint '%s' precisely", item_name)
+            return None
+
+        if locate_result.pixel_x < 0 or locate_result.pixel_y < 0:
+            logger.info("VLM found '%s' but no pixel coords", item_name)
+            return None
+
+        px = min(max(locate_result.pixel_x, 0), cam_w - 1)
+        py = min(max(locate_result.pixel_y, 0), cam_h - 1)
+
+        # Depth → 3D world position
+        world_pos = self.env.pixel_to_world(px, py, depth, cam_w, cam_h)
+        if world_pos is not None:
+            logger.info(
+                "VLM located '%s' at pixel (%d,%d) → world [%.2f, %.2f, %.2f]",
+                item_name, px, py, world_pos[0], world_pos[1], world_pos[2],
+            )
+        return world_pos
+
+    async def _vision_locate_3d(self, item_name: str, cam_w: int = 640, cam_h: int = 480) -> np.ndarray | None:
+        """Use VLM + depth buffer to find item's 3D world position from vision.
+
+        Returns 3D numpy array [x, y, z] or None if vision fails.
+        """
+        try:
+            if self._detector is None:
+                from sous_bot.vision.detector import IngredientDetector
+                self._detector = IngredientDetector()
+                logger.info("VLM vision detector initialized (Qwen2.5-VL)")
+
+            # Render RGBD from robot's eyes
+            rgbd = self.env.render_robot_view_rgbd(cam_w, cam_h)
+            if rgbd is None:
+                logger.warning("Could not capture robot RGBD view")
+                return None
+            rgb, depth = rgbd
+
+            # Encode RGB to JPEG for VLM
+            import cv2
+            _, jpeg = cv2.imencode(".jpg", rgb[:, :, ::-1])
+            image_bytes = jpeg.tobytes()
+
+            # Ask VLM: "Where is this item?" → get pixel coordinates
+            logger.info("VLM scanning shelf for '%s' (pixel detection)...", item_name)
             result = await asyncio.to_thread(
-                self._detector.locate_item_on_shelf, image_bytes, item_name
+                self._detector.locate_item_on_shelf, image_bytes, item_name,
+                cam_w, cam_h,
             )
 
-            if result.found and result.confidence >= 0.5:
+            if not result.found or result.confidence < 0.5:
                 logger.info(
-                    "VLM found '%s' at %s (confidence: %.2f) — %s",
-                    item_name, result.position, result.confidence, result.description,
-                )
-                return True
-            else:
-                logger.info(
-                    "VLM did not confidently find '%s' (found=%s, conf=%.2f)",
+                    "VLM did not find '%s' (found=%s, conf=%.2f)",
                     item_name, result.found, result.confidence,
                 )
-                return False
+                return None
+
+            logger.info(
+                "VLM found '%s' at pixel (%d, %d), conf=%.2f — %s",
+                item_name, result.pixel_x, result.pixel_y,
+                result.confidence, result.description,
+            )
+
+            # Check if VLM returned valid pixel coordinates
+            if result.pixel_x < 0 or result.pixel_y < 0:
+                logger.info("VLM found '%s' but no pixel coords — falling back", item_name)
+                return None
+            if result.pixel_x >= cam_w or result.pixel_y >= cam_h:
+                logger.info("VLM pixel coords out of bounds — falling back")
+                return None
+
+            # Convert pixel + depth → 3D world position
+            world_pos = self.env.pixel_to_world(
+                result.pixel_x, result.pixel_y, depth, cam_w, cam_h,
+            )
+            if world_pos is not None:
+                logger.info(
+                    "Vision-based 3D position for '%s': [%.2f, %.2f, %.2f]",
+                    item_name, world_pos[0], world_pos[1], world_pos[2],
+                )
+            return world_pos
+
         except Exception as e:
-            logger.warning("VLM vision failed: %s — proceeding without vision", e)
-            return False
+            logger.warning("VLM 3D vision failed: %s — falling back to lookup", e)
+            return None
 
     async def reach(self, target: str, parameters: dict | None = None) -> ActionResult:
-        """Reach arm toward an item using IK to target the exact item position."""
+        """Reach arm toward an item — uses VLM vision to find it, falls back to lookup."""
         action = RobotAction(action="reach", target=target, parameters=parameters or {})
         self._current_action = action
 
-        # VLM scan: robot is at the shelf now — use vision to confirm item
+        # Try VLM-based 3D detection first — the robot actually SEES the item
+        item_pos = None
         if self._use_vision:
-            found = await self._vision_locate(target)
-            if found:
-                logger.info("VLM confirmed '%s' on shelf — reaching", target)
+            item_pos = await self._vision_locate_3d(target)
+            if item_pos is not None:
+                logger.info("Using VISION-DETECTED position for '%s'", target)
             else:
-                logger.info("VLM did not confirm '%s' — reaching by store lookup", target)
+                logger.info("Vision failed for '%s' — falling back to store lookup", target)
 
-        item_pos = self.env.get_item_position(target)
+        # Fall back to hardcoded store lookup if vision didn't work
+        if item_pos is None:
+            item_pos = self.env.get_item_position(target)
+
         if item_pos is None:
             return ActionResult(action=action, status=ActionStatus.FAILED,
                                 message=f"Cannot see item '{target}' to reach for it")

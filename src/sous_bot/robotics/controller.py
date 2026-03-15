@@ -54,13 +54,21 @@ class RobotController:
 
         aisle = result.data.get("aisle", "")
         item_pos = result.data.get("position")
-        logger.info("Item %s located in %s aisle at %s", item_name, aisle, item_pos)
+        vision_detected = result.data.get("vision_detected", False)
+        logger.info("Item %s located in %s aisle at %s (vision=%s)",
+                     item_name, aisle, item_pos, vision_detected)
 
-        # 2. Navigate directly toward the item (stand in aisle near the shelf)
-        if item_pos:
-            # Stand in the aisle near the item — offset y toward center so robot
-            # faces the shelf rather than standing inside it
-            stand_y = item_pos[1] * 0.6  # Move partway toward shelf from center
+        # 2. Navigate to the item
+        if vision_detected and item_pos:
+            # Vision already walked us to the aisle during scanning —
+            # just stand near the detected position
+            stand_y = item_pos[1] * 0.6
+            result = await self.adapter.execute(
+                RobotAction(action="navigate", target=item_name,
+                            parameters={"position": [item_pos[0], stand_y]})
+            )
+        elif item_pos:
+            stand_y = item_pos[1] * 0.6
             result = await self.adapter.execute(
                 RobotAction(action="navigate", target=item_name,
                             parameters={"position": [item_pos[0], stand_y]})

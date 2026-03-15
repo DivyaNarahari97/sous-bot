@@ -3,14 +3,13 @@
 
 Flow:
     1. User enters recipes they want to cook
-    2. Nebius LLM extracts all required ingredients
-    3. Ingredients are matched to store inventory
+    2. API calls Nebius LLM to extract all required ingredients
+    3. GET /generate-shopping-list returns matched store items
     4. Robot simulation picks all matched items
 
 Usage:
     uv run python scripts/run_viewer.py
-    uv run python scripts/run_viewer.py --items pasta eggs milk
-    uv run python scripts/run_viewer.py --skip-llm
+    uv run python scripts/run_viewer.py --items carbonara "stir fry"
 
 Controls:
     Left-click + drag  : Rotate camera
@@ -25,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import math
 import os
@@ -51,12 +49,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 logger = logging.getLogger("pantrypilot")
 
 WIDTH, HEIGHT = 1280, 720
-
-DEMO_SHOPPING_LIST = [
-    ShoppingItem(name="guanciale", quantity="150g", aisle="deli"),
-    ShoppingItem(name="black pepper", quantity="1 tsp", aisle="spices"),
-    ShoppingItem(name="olive oil", quantity="1 bottle", aisle="produce"),
-]
 
 
 # ── T1 API Server ────────────────────────────────────────────────────────────
@@ -113,7 +105,7 @@ def get_shopping_list_from_api(recipes: list[str]) -> list[ShoppingItem]:
     # Try to get structured shopping list
     try:
         resp2 = http_requests.get(
-            f"{base}/shopping-list",
+            f"{base}/generate-shopping-list",
             params={"session_id": session_id},
             timeout=10,
         )
@@ -457,26 +449,19 @@ class GroceryViewer:
 def main():
     parser = argparse.ArgumentParser(description="PantryPilot — Full Pipeline")
     parser.add_argument("--items", nargs="+", default=None,
-                        help="Directly specify item names (skip LLM)")
-    parser.add_argument("--skip-llm", action="store_true",
-                        help="Use demo shopping list instead of LLM")
+                        help="Recipe names to cook (e.g. --items carbonara 'stir fry')")
     parser.add_argument("--no-vision", action="store_true",
                         help="Disable VLM shelf scanning (use lookup only)")
     args = parser.parse_args()
 
-    if args.items:
-        # Direct item list
-        items = [ShoppingItem(name=name) for name in args.items]
-        print(f"\nDirect items: {[i.name for i in items]}\n")
-    elif args.skip_llm:
-        items = DEMO_SHOPPING_LIST
-        print(f"\nDemo list: {[i.name for i in items]}\n")
-    else:
-        # ── Start T1 API server ──
-        print("\nStarting PantryPilot API server...")
-        start_api_server()
+    # ── Always start the API server ──
+    print("\nStarting PantryPilot API server...")
+    start_api_server()
 
-        # ── Phase 1: Get recipes from user ──
+    # ── Phase 1: Get recipes ──
+    if args.items:
+        recipes = args.items
+    else:
         print("\n" + "=" * 60)
         print("  PantryPilot — What do you want to cook?")
         print("=" * 60)
@@ -485,26 +470,27 @@ def main():
 
         recipe_input = input("> ").strip()
         if not recipe_input:
-            print("No recipes entered — using demo list")
-            items = DEMO_SHOPPING_LIST
-        else:
-            recipes = [r.strip() for r in recipe_input.split(",")]
-            print(f"\nRecipes: {recipes}")
+            print("No recipes entered, defaulting to: carbonara")
+            recipe_input = "carbonara"
+        recipes = [r.strip() for r in recipe_input.split(",")]
 
-            # ── Phase 2: Call T1 API for shopping list ──
-            print("\nAsking T1 Planner API for shopping list...")
-            items = get_shopping_list_from_api(recipes)
+    print(f"\nRecipes: {recipes}")
 
-            if not items:
-                print("T1 API returned no items — using demo list")
-                items = DEMO_SHOPPING_LIST
-            else:
-                print(f"\n{'=' * 60}")
-                print(f"  Shopping List (from T1 API) — {len(items)} items to fetch:")
-                print(f"{'=' * 60}")
-                for item in items:
-                    print(f"  • {item.name} ({item.quantity}) — {item.aisle} aisle")
-                print()
+    # ── Phase 2: Call T1 API for shopping list ──
+    print("\nAsking Planner API for shopping list...")
+    items = get_shopping_list_from_api(recipes)
+
+    if not items:
+        print("API returned no matchable items — cannot proceed.")
+        print("Check that NEBIUS_API_KEY is set in .env")
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f"  Shopping List (from API) — {len(items)} items to fetch:")
+    print(f"{'=' * 60}")
+    for item in items:
+        print(f"  • {item.name} ({item.quantity}) — {item.aisle} aisle")
+    print()
 
     print(f"Starting simulation with {len(items)} items...\n")
 
