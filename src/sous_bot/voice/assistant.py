@@ -116,7 +116,7 @@ ASSISTANT_PROMPT = (
 
 
 class _FallbackPlanner:
-    """Minimal Nebius LLM planner used until T1 builds the real one."""
+    """Nebius LLM planner with Tavily recipe search for grounding."""
 
     def __init__(self) -> None:
         self._client = OpenAI(
@@ -124,11 +124,35 @@ class _FallbackPlanner:
             api_key=os.environ["NEBIUS_API_KEY"],
         )
         self._model = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        self._searcher = None
+
+    def _get_searcher(self):
+        if self._searcher is None:
+            try:
+                from sous_bot.vision.recipe_search import RecipeSearcher
+                self._searcher = RecipeSearcher()
+            except (ImportError, KeyError):
+                self._searcher = None
+        return self._searcher
 
     def plan_meal(self, available: list[str]) -> str:
+        # Search for real recipes grounded in web results
+        searcher = self._get_searcher()
+        recipe_context = ""
+        if searcher:
+            results = searcher.search_recipe(
+                f"easy recipe with {', '.join(available[:5])}"
+            )
+            if results:
+                recipe_context = (
+                    "\n\nHere are some real recipes I found:\n"
+                    + "\n".join(f"- {r.title}: {r.snippet[:150]}" for r in results[:2])
+                )
+
         return self._ask(
             f"I have these ingredients: {', '.join(available)}. "
             "Suggest ONE simple meal I can make. Be brief."
+            + recipe_context
         )
 
     def get_shopping_list(self, available: list[str]) -> list[dict]:
