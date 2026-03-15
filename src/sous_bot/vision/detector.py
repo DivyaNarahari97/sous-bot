@@ -39,9 +39,13 @@ class LocateResult(BaseModel):
 
 VISION_PROMPT = (
     "You are a pantry inventory assistant. Analyze this image and identify all "
-    "visible food ingredients, groceries, and pantry items. Return a JSON array "
-    "where each element has 'name' (string, lowercase) and 'confidence' (float "
-    "0-1). Only include items you can clearly identify. Example: "
+    "visible food ingredients, groceries, and pantry items. "
+    "IMPORTANT: List each individual product SEPARATELY. Do not combine adjacent "
+    "items into one name. For example, 'beef' and 'yogurt' are two separate items, "
+    "not 'beef yogurt'. Each name should be a single product. "
+    "Return a JSON array "
+    "where each element has 'name' (string, lowercase, one product per entry) and "
+    "'confidence' (float 0-1). Only include items you can clearly identify. Example: "
     '[{"name": "milk", "confidence": 0.95}, {"name": "eggs", "confidence": 0.9}]'
 )
 
