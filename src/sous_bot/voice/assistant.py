@@ -59,11 +59,25 @@ class RoboticsCallback(Protocol):
 
 
 class T1ApiPlanner:
-    """Calls T1's planner API endpoints over HTTP."""
+    """Calls T1's planner API endpoints over HTTP.
+
+    Sends T3 vision-detected ingredients alongside manual inventory
+    so T1 can use full context for meal planning.
+    """
 
     def __init__(self, base_url: str = "http://localhost:8000") -> None:
         self._base_url = base_url.rstrip("/")
         self._session_id = "voice-session"
+        self._last_plan: dict | None = None  # Cache last plan for shopping list
+
+    def _build_detected(self, context: dict | None = None) -> list[dict]:
+        """Convert T3 detected ingredients to T1's DetectedIngredient format."""
+        detected = context.get("detected", []) if context else []
+        return [
+            {"name": d["name"], "confidence": d.get("confidence", 1.0)}
+            for d in detected
+            if isinstance(d, dict) and "name" in d
+        ]
 
     def plan_meal(self, available: list[str]) -> str:
         resp = http_requests.post(
@@ -76,32 +90,56 @@ class T1ApiPlanner:
             timeout=30,
         )
         if resp.ok:
-            return resp.json().get("message", "No response from planner.")
+            data = resp.json()
+            self._last_plan = data.get("plan")
+            return data.get("message", "No response from planner.")
         return "Planner API unavailable."
 
     def get_shopping_list(self, available: list[str]) -> list[dict]:
-        # First ask planner to generate a plan
+        """Get shopping list from T1's session.
+
+        T1 returns ShoppingListByRecipe with recipe-grouped items.
+        Flatten into the list[dict] format T3 expects.
+        """
         resp = http_requests.get(
             f"{self._base_url}/shopping-list",
             params={"session_id": self._session_id},
             timeout=15,
         )
         if resp.ok:
-            return resp.json().get("items", [])
+            data = resp.json()
+            # T1 returns {"recipes": [{"recipe": "...", "items": [...]}]}
+            items: list[dict] = []
+            for recipe_group in data.get("recipes", []):
+                for item in recipe_group.get("items", []):
+                    items.append({
+                        "name": item.get("name", ""),
+                        "quantity": item.get("quantity", ""),
+                        "aisle": item.get("aisle"),
+                    })
+            return items
+
+        # Fallback: extract from cached plan if shopping-list endpoint fails
+        if self._last_plan and self._last_plan.get("shopping_list"):
+            return self._last_plan["shopping_list"]
         return []
 
     def chat(self, message: str, context: dict) -> str:
+        detected = self._build_detected(context)
         resp = http_requests.post(
             f"{self._base_url}/chat",
             json={
                 "session_id": self._session_id,
                 "message": message,
                 "available_ingredients": context.get("available", []),
+                "detected_ingredients": detected,
             },
             timeout=30,
         )
         if resp.ok:
-            return resp.json().get("message", "No response.")
+            data = resp.json()
+            self._last_plan = data.get("plan")
+            return data.get("message", "No response.")
         return "Planner API unavailable."
 
 
@@ -418,6 +456,9 @@ class VoiceAssistant:
         context = {
             "available": inv.available,
             "missing": inv.missing,
+            "detected": [
+                {"name": name, "confidence": 1.0} for name in inv.available
+            ],
         }
         response = self._planner.chat(message, context)
         self._say(response)
