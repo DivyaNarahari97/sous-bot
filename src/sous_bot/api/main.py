@@ -10,6 +10,7 @@ from sous_bot.api.schemas import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
+    PlanResponse,
     ShoppingListResponse,
 )
 from sous_bot.planner.engine import PlannerEngine, load_settings

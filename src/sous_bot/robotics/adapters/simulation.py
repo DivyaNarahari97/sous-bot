@@ -25,9 +25,13 @@ logger = logging.getLogger(__name__)
 
 # --- Timing constants ---
 POSITION_TOLERANCE = 0.15
-NAV_SPEED = 4.0
+NAV_SPEED = 2.5          # Slower, more realistic walking
 SIM_STEPS_PER_TICK = 50
-FRAME_DELAY = 0.01
+FRAME_DELAY = 0.02       # Slower tick — more visible motion
+
+# Cart bounds for avoidance (cart is at ~0.5, -0.3)
+CART_CENTER = (0.5, -0.3)
+CART_AVOID_RADIUS = 0.6  # Stay this far from cart center when navigating
 
 # --- Arm pose waypoints (joint-space, inspired by ark_unitree_g1 pick-and-place) ---
 # Each pose is (shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw)
@@ -160,38 +164,45 @@ class SimulationAdapter(RobotAdapter):
             return ActionResult(action=action, status=ActionStatus.FAILED,
                                 message=f"Cannot see item '{target}' to reach for it")
 
-        # Step 1: Raise arm above the item first
+        # Step 1: Open hand first (prepare to grab)
+        logger.info("Opening hand, preparing to reach for %s", target)
+        await self._interpolate_hand(HAND_CLOSED, HAND_OPEN, frames=15)
+        await self._hold(8)
+
+        # Step 2: Raise arm above the item first
         logger.info("Raising arm to approach %s", target)
         above_pos = item_pos.copy()
         above_pos[2] += 0.15  # 15cm above item
         above_ik = self.env.solve_ik_right_arm(above_pos)
         if above_ik:
-            await self._interpolate_arm(ARM_REST, above_ik, frames=20)
+            await self._interpolate_arm(ARM_REST, above_ik, frames=40)
         else:
-            # Fallback to fixed pose if IK fails
             robot_pos = self.env.get_robot_position()
             side = 1.0 if (item_pos[1] - robot_pos[1]) > 0 else -1.0
             above = list(ARM_ABOVE)
             above[1] *= side
             above[2] *= side
-            await self._interpolate_arm(ARM_REST, tuple(above), frames=20)
+            await self._interpolate_arm(ARM_REST, tuple(above), frames=40)
 
-        # Step 2: Lower arm to item position (IK to exact item location)
+        # Step 3: Pause above — looking at item
+        await self._hold(15)
+
+        # Step 4: Lower arm carefully to item position
         logger.info("Reaching for %s", target)
         reach_ik = self.env.solve_ik_right_arm(item_pos)
         start_pose = above_ik if above_ik else ARM_ABOVE
         if reach_ik:
-            await self._interpolate_arm(start_pose, reach_ik, frames=20)
+            await self._interpolate_arm(start_pose, reach_ik, frames=35)
         else:
             robot_pos = self.env.get_robot_position()
             side = 1.0 if (item_pos[1] - robot_pos[1]) > 0 else -1.0
             reach = list(ARM_REACH)
             reach[1] *= side
             reach[2] *= side
-            await self._interpolate_arm(start_pose, tuple(reach), frames=20)
+            await self._interpolate_arm(start_pose, tuple(reach), frames=35)
 
-        # Step 3: Hold at item — hand should be right at the item
-        await self._hold(10)
+        # Step 5: Hold at item — positioning hand
+        await self._hold(15)
 
         # Save the reach pose for grasp to use when lifting
         self._last_reach_pose = reach_ik if reach_ik else ARM_REACH
@@ -209,20 +220,29 @@ class SimulationAdapter(RobotAdapter):
             return ActionResult(action=action, status=ActionStatus.FAILED,
                                 message=f"Cannot grasp '{target}' — not on shelf")
 
-        # Step 1: Close hand around item (item stays on shelf visually)
+        # Step 1: Close hand slowly around item
         logger.info("Closing hand on %s", target)
-        await self._interpolate_hand(HAND_OPEN, HAND_CLOSED, frames=20)
+        await self._interpolate_hand(HAND_OPEN, HAND_CLOSED, frames=35)
 
-        # Step 2: Hold grip
-        await self._hold(5)
+        # Step 2: Hold grip — securing item
+        logger.info("Securing grip on %s", target)
+        await self._hold(15)
 
-        # Step 3: Item picked — instant snap to hand (no floating)
+        # Step 3: Item picked — snap to hand
         self.env.mark_item_picked(target)
 
-        # Step 4: Lift from shelf to carry position
-        logger.info("Lifting %s from shelf", target)
+        # Step 4: Slight pull back before lifting (tug off shelf)
         lift_from = getattr(self, '_last_reach_pose', ARM_REACH)
-        await self._interpolate_arm(lift_from, ARM_CARRY, frames=25)
+        tug_pose = tuple(
+            lf * 0.85 + carry * 0.15 for lf, carry in zip(lift_from, ARM_CARRY)
+        )
+        logger.info("Pulling %s from shelf", target)
+        await self._interpolate_arm(lift_from, tug_pose, frames=20)
+        await self._hold(10)
+
+        # Step 5: Lift from shelf to carry position
+        logger.info("Lifting %s from shelf", target)
+        await self._interpolate_arm(tug_pose, ARM_CARRY, frames=40)
 
         self._held_item = target
         self._current_action = None
@@ -242,21 +262,24 @@ class SimulationAdapter(RobotAdapter):
 
         item = self._held_item
 
-        # Step 5: Lower arm over cart
-        logger.info("Lowering %s over cart", item)
-        await self._interpolate_arm(ARM_CARRY, ARM_DROP, frames=20)
+        # Step 5: Extend arm outward toward cart
+        logger.info("Extending arm over cart with %s", item)
+        await self._interpolate_arm(ARM_CARRY, ARM_DROP, frames=40)
 
-        # Step 6: Open hand — item drops instantly into cart
+        # Step 6: Pause — positioning over cart
+        await self._hold(15)
+
+        # Step 7: Open hand slowly — item drops into cart
         logger.info("Releasing %s into cart", item)
-        await self._interpolate_hand(HAND_CLOSED, HAND_OPEN, frames=15)
+        await self._interpolate_hand(HAND_CLOSED, HAND_OPEN, frames=30)
         self.env.detach_item()
 
-        # Step 7: Brief pause
-        await self._hold(5)
+        # Step 8: Pause — watch item settle
+        await self._hold(15)
 
-        # Step 8: Return arm to rest
+        # Step 9: Return arm to rest slowly
         logger.info("Returning arm to rest")
-        await self._interpolate_arm(ARM_DROP, ARM_REST, frames=15)
+        await self._interpolate_arm(ARM_DROP, ARM_REST, frames=30)
 
         self._held_item = None
         self._items_in_cart.append(item)
@@ -318,8 +341,47 @@ class SimulationAdapter(RobotAdapter):
             return (CART_POSITION[0], CART_POSITION[1])
         return None
 
+    def _plan_waypoints(self, tx: float, ty: float) -> list[tuple[float, float]]:
+        """Plan waypoints that avoid the cart."""
+        pos = self.env.get_robot_position()
+        sx, sy = pos[0], pos[1]
+
+        # Check if direct path passes near cart
+        cx, cy = CART_CENTER
+        # Simple check: if start or end is near cart, add a detour waypoint
+        steps = 10
+        needs_detour = False
+        for i in range(steps + 1):
+            t = i / steps
+            px = sx + t * (tx - sx)
+            py = sy + t * (ty - sy)
+            if math.sqrt((px - cx) ** 2 + (py - cy) ** 2) < CART_AVOID_RADIUS:
+                needs_detour = True
+                break
+
+        if needs_detour:
+            # Go around the cart on the positive-y side
+            detour_y = cy + CART_AVOID_RADIUS + 0.3
+            waypoints = []
+            # First go to detour y at current x
+            if abs(sy - cy) < CART_AVOID_RADIUS + 0.2:
+                waypoints.append((sx, detour_y))
+            # Then traverse past cart
+            waypoints.append((tx, detour_y))
+            # Then go to target
+            waypoints.append((tx, ty))
+            return waypoints
+
+        return [(tx, ty)]
+
     async def _move_to(self, tx: float, ty: float) -> None:
-        """Move robot toward target — teleport base with facing direction."""
+        """Move robot toward target via waypoints, avoiding the cart."""
+        waypoints = self._plan_waypoints(tx, ty)
+        for wx, wy in waypoints:
+            await self._move_to_point(wx, wy)
+
+    async def _move_to_point(self, tx: float, ty: float) -> None:
+        """Move robot toward a single point."""
         for _ in range(500):
             pos = self.env.get_robot_position()
             dx, dy = tx - pos[0], ty - pos[1]

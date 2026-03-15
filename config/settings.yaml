@@ -2,9 +2,12 @@
 # API keys should be set in .env, not here
 
 planner:
-  model: "claude-sonnet-4-20250514"
+  provider: "nebius"
+  model: "meta-llama/Llama-3.3-70B-Instruct"
   temperature: 0.3
   max_tokens: 4096
+  nebius_base_url: "https://api.studio.nebius.com/v1/"
+  nebius_api_key: "${NEBIUS_API_KEY}"
 
 vision:
   camera_index: 0

@@ -35,14 +35,17 @@ import time
 import glfw
 import mujoco
 import numpy as np
+import requests as http_requests
+import uvicorn
 from dotenv import load_dotenv
-from openai import OpenAI
 
 from sim.grocery_env import GroceryStoreEnv, STORE_ITEMS
 from sous_bot.robotics.adapters.simulation import SimulationAdapter
 from sous_bot.robotics.controller import RobotController, ShoppingItem
 
 load_dotenv()
+
+API_PORT = 8321  # Local port for T1's API server
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("pantrypilot")
@@ -56,107 +59,105 @@ DEMO_SHOPPING_LIST = [
 ]
 
 
-# ── Phase 1: Recipe → Ingredients (Nebius LLM) ──────────────────────────────
+# ── T1 API Server ────────────────────────────────────────────────────────────
 
-def get_ingredients_from_recipes(recipes: list[str]) -> list[dict]:
-    """Call Nebius LLM to extract all ingredients from user's recipes."""
-    api_key = os.getenv("NEBIUS_API_KEY")
-    if not api_key:
-        logger.warning("NEBIUS_API_KEY not set — using demo shopping list")
-        return []
+def start_api_server() -> None:
+    """Start T1's FastAPI server in a background thread."""
+    from sous_bot.api.main import app
 
+    def _run():
+        uvicorn.run(app, host="127.0.0.1", port=API_PORT, log_level="warning")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    # Wait for server to be ready
+    for _ in range(30):
+        try:
+            http_requests.get(f"http://127.0.0.1:{API_PORT}/docs", timeout=1)
+            logger.info("T1 API server ready on port %d", API_PORT)
+            return
+        except Exception:
+            time.sleep(0.5)
+    logger.warning("T1 API server may not be ready — continuing anyway")
+
+
+# ── Phase 1+2: Recipe → Shopping List (via T1 /chat + /shopping-list) ────────
+
+def get_shopping_list_from_api(recipes: list[str]) -> list[ShoppingItem]:
+    """Call T1's /chat endpoint to get a shopping list for recipes."""
+    base = f"http://127.0.0.1:{API_PORT}"
     store_item_names = sorted(STORE_ITEMS.keys())
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.studio.nebius.com/v1/",
+    message = (
+        f"I want to cook {', '.join(recipes)} for 1 day, 2 servings per day. "
+        f"Give me the complete shopping list immediately. "
+        f"Only use items from this store: {', '.join(store_item_names)}"
     )
 
-    prompt = f"""You are a cooking assistant. The user wants to cook these recipes:
-{', '.join(recipes)}
-
-Here are the items available in our grocery store:
-{', '.join(store_item_names)}
-
-Return a JSON array of ingredients needed. ONLY include items that exist in the store list above.
-For each item, include: name (must exactly match a store item), quantity, and aisle.
-
-Example: [{{"name": "eggs", "quantity": "6", "aisle": "dairy"}}, {{"name": "pasta", "quantity": "500g", "aisle": "bakery"}}]
-
-Return ONLY the JSON array, no other text."""
-
-    logger.info("Asking Nebius LLM for ingredients for: %s", recipes)
-
+    logger.info("Calling T1 /chat API for recipes: %s", recipes)
     try:
-        response = client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct",
-            messages=[
-                {"role": "system", "content": "You are a precise cooking ingredient extractor. Return only valid JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-            max_tokens=2000,
+        resp = http_requests.post(
+            f"{base}/chat",
+            json={"message": message, "available_ingredients": []},
+            timeout=120,
         )
+        resp.raise_for_status()
+        data = resp.json()
+        session_id = data.get("session_id", "")
+        logger.info("T1 /chat response: %s", data.get("message", "")[:100])
     except Exception as e:
-        logger.error("Nebius API call failed: %s", e)
+        logger.error("T1 /chat failed: %s", e)
         return []
 
-    text = response.choices[0].message.content.strip()
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
+    # Try to get structured shopping list
     try:
-        ingredients = json.loads(text)
-        logger.info("LLM returned %d ingredients", len(ingredients))
-        return ingredients
-    except json.JSONDecodeError:
-        logger.error("Failed to parse LLM response: %s", text[:200])
-        return []
+        resp2 = http_requests.get(
+            f"{base}/shopping-list",
+            params={"session_id": session_id},
+            timeout=10,
+        )
+        if resp2.ok:
+            sl_data = resp2.json()
+            items = []
+            store_names = set(STORE_ITEMS.keys())
+            for recipe_block in sl_data.get("recipes", []):
+                for item in recipe_block.get("items", []):
+                    name = item.get("name", "").lower().strip()
+                    # Match to store
+                    if name in store_names:
+                        info = STORE_ITEMS[name]
+                        items.append(ShoppingItem(
+                            name=name,
+                            quantity=item.get("quantity", "1"),
+                            aisle=info["aisle"],
+                        ))
+                    else:
+                        for store_name in store_names:
+                            if name in store_name or store_name in name:
+                                info = STORE_ITEMS[store_name]
+                                items.append(ShoppingItem(
+                                    name=store_name,
+                                    quantity=item.get("quantity", "1"),
+                                    aisle=info["aisle"],
+                                ))
+                                break
 
+            # Deduplicate
+            seen = set()
+            unique = []
+            for it in items:
+                if it.name not in seen:
+                    seen.add(it.name)
+                    unique.append(it)
+            if unique:
+                logger.info("T1 API returned %d matched store items", len(unique))
+                return unique
+            logger.warning("T1 /shopping-list returned no matchable items")
+    except Exception as e:
+        logger.warning("T1 /shopping-list failed: %s — will parse chat reply", e)
 
-# ── Phase 2: Match ingredients to store ──────────────────────────────────────
-
-def match_to_store(ingredients: list[dict]) -> list[ShoppingItem]:
-    """Match LLM ingredients to actual store items."""
-    matched = []
-    store_names = set(STORE_ITEMS.keys())
-
-    for ing in ingredients:
-        name = ing.get("name", "").lower().strip()
-        if name in store_names:
-            info = STORE_ITEMS[name]
-            matched.append(ShoppingItem(
-                name=name,
-                quantity=ing.get("quantity", "1"),
-                aisle=info["aisle"],
-            ))
-        else:
-            # Try fuzzy match — check if store item contains ingredient name or vice versa
-            for store_name in store_names:
-                if name in store_name or store_name in name:
-                    info = STORE_ITEMS[store_name]
-                    matched.append(ShoppingItem(
-                        name=store_name,
-                        quantity=ing.get("quantity", "1"),
-                        aisle=info["aisle"],
-                    ))
-                    break
-            else:
-                logger.warning("Item '%s' not found in store — skipping", name)
-
-    # Deduplicate by name
-    seen = set()
-    unique = []
-    for item in matched:
-        if item.name not in seen:
-            seen.add(item.name)
-            unique.append(item)
-
-    return unique
+    return []
 
 
 # ── Phase 3: Interactive Viewer + Simulation ─────────────────────────────────
@@ -305,16 +306,15 @@ class GroceryViewer:
 
                 if success:
                     fetched.append(item.name)
+                    self._fetched = list(fetched)  # Update HUD immediately
                     self._show_pick(item.name)
                     self._log(f"Picked {item.name} -> cart ({len(fetched)}/{len(self.items)})")
                 else:
                     failed.append(item.name)
+                    self._failed = list(failed)
                     self._log(f"FAILED to get {item.name}")
 
                 self._status_text = f"Cart: {len(fetched)}/{len(self.items)} items"
-
-            self._fetched = fetched
-            self._failed = failed
             self._current_item = ""
             self._current_step = ""
 
@@ -375,19 +375,26 @@ class GroceryViewer:
             pip_w, pip_h = fb_width // 4, fb_height // 4
             pip_viewport = mujoco.MjrRect(fb_width - pip_w - 10, 10, pip_w, pip_h)
 
-            # Update robot camera to follow robot's head
-            robot_pos = self.env.get_robot_position()
+            # Update robot camera — true first-person from robot's eyes
+            # Get torso world position and robot heading
+            torso_id = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+            torso_pos = self.env.data.xpos[torso_id]
             w, x, y, z = (self.env.data.qpos[3], self.env.data.qpos[4],
                            self.env.data.qpos[5], self.env.data.qpos[6])
             yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
-            look_dist = 1.5
-            self._robot_camera.lookat[0] = robot_pos[0] + look_dist * math.cos(yaw)
-            self._robot_camera.lookat[1] = robot_pos[1] + look_dist * math.sin(yaw)
-            self._robot_camera.lookat[2] = robot_pos[2] + 0.5
-            self._robot_camera.distance = look_dist
-            self._robot_camera.azimuth = math.degrees(yaw) + 180
-            self._robot_camera.elevation = -15
+            # Eye position: top of torso + 0.6m up (head), 0.3m forward (past geometry)
+            eye_x = torso_pos[0] + 0.3 * math.cos(yaw)
+            eye_y = torso_pos[1] + 0.3 * math.sin(yaw)
+            eye_z = torso_pos[2] + 0.6
+
+            # Lookat: just barely ahead of the eye (tiny distance = camera at eye)
+            self._robot_camera.lookat[0] = eye_x + 0.01 * math.cos(yaw)
+            self._robot_camera.lookat[1] = eye_y + 0.01 * math.sin(yaw)
+            self._robot_camera.lookat[2] = eye_z - 0.05  # Slight downward gaze
+            self._robot_camera.distance = 0.01
+            self._robot_camera.azimuth = math.degrees(yaw)
+            self._robot_camera.elevation = -10
 
             mujoco.mjv_updateScene(
                 self.env.model, self.env.data, self.option, None,
@@ -465,6 +472,10 @@ def main():
         items = DEMO_SHOPPING_LIST
         print(f"\nDemo list: {[i.name for i in items]}\n")
     else:
+        # ── Start T1 API server ──
+        print("\nStarting PantryPilot API server...")
+        start_api_server()
+
         # ── Phase 1: Get recipes from user ──
         print("\n" + "=" * 60)
         print("  PantryPilot — What do you want to cook?")
@@ -480,26 +491,20 @@ def main():
             recipes = [r.strip() for r in recipe_input.split(",")]
             print(f"\nRecipes: {recipes}")
 
-            # ── Phase 2: LLM extracts ingredients ──
-            print("\nAsking AI for required ingredients...")
-            ingredients = get_ingredients_from_recipes(recipes)
+            # ── Phase 2: Call T1 API for shopping list ──
+            print("\nAsking T1 Planner API for shopping list...")
+            items = get_shopping_list_from_api(recipes)
 
-            if not ingredients:
-                print("Could not get ingredients — using demo list")
+            if not items:
+                print("T1 API returned no items — using demo list")
                 items = DEMO_SHOPPING_LIST
             else:
-                # ── Phase 3: Match to store ──
-                items = match_to_store(ingredients)
-                if not items:
-                    print("No matching items found in store — using demo list")
-                    items = DEMO_SHOPPING_LIST
-                else:
-                    print(f"\n{'=' * 60}")
-                    print(f"  Shopping List — {len(items)} items to fetch:")
-                    print(f"{'=' * 60}")
-                    for item in items:
-                        print(f"  • {item.name} ({item.quantity}) — {item.aisle} aisle")
-                    print()
+                print(f"\n{'=' * 60}")
+                print(f"  Shopping List (from T1 API) — {len(items)} items to fetch:")
+                print(f"{'=' * 60}")
+                for item in items:
+                    print(f"  • {item.name} ({item.quantity}) — {item.aisle} aisle")
+                print()
 
     print(f"Starting simulation with {len(items)} items...\n")
 

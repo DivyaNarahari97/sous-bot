@@ -829,17 +829,23 @@ class GroceryStoreEnv:
         w, x, y, z = self.data.qpos[3], self.data.qpos[4], self.data.qpos[5], self.data.qpos[6]
         yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
-        # Camera at head height, looking forward
-        head_height = 1.4  # G1 is ~1.3m tall, camera slightly above
-        look_dist = 1.5    # Look 1.5m ahead
+        # True first-person: camera AT robot's eyes
+        torso_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+        torso_pos = self.data.xpos[torso_id]
 
-        camera.lookat[0] = robot_pos[0] + look_dist * math.cos(yaw)
-        camera.lookat[1] = robot_pos[1] + look_dist * math.sin(yaw)
-        camera.lookat[2] = robot_pos[2] + 0.5  # Look at shelf height
+        # Eye: top of torso + 0.6m up, 0.3m forward past body geometry
+        eye_x = torso_pos[0] + 0.3 * math.cos(yaw)
+        eye_y = torso_pos[1] + 0.3 * math.sin(yaw)
+        eye_z = torso_pos[2] + 0.6
 
-        camera.distance = look_dist
-        camera.azimuth = math.degrees(yaw) + 180  # Face forward
-        camera.elevation = -15  # Slight downward angle toward shelves
+        # Tiny distance = camera sits right at the eye position
+        camera.lookat[0] = eye_x + 0.01 * math.cos(yaw)
+        camera.lookat[1] = eye_y + 0.01 * math.sin(yaw)
+        camera.lookat[2] = eye_z - 0.05  # Slight downward toward shelves
+
+        camera.distance = 0.01
+        camera.azimuth = math.degrees(yaw)  # Face forward
+        camera.elevation = -10
 
         renderer.update_scene(self.data, camera)
         frame = renderer.render()
