@@ -62,14 +62,19 @@ Pantry inventory: {inventory}
 Grounding sources:
 {sources}
 
-Generate a combined weekly shopping list as JSON with this schema:
+Generate a weekly shopping list broken down by recipe as JSON with this schema:
 {{
-  "missing_ingredients": [{{"name": "...", "quantity": "..."}}],
-  "shopping_list": [{{"name": "...", "quantity": "...", "aisle": "..."}}]
+  "recipes": [
+    {{
+      "recipe": "...",
+      "missing_ingredients": [{{"name": "...", "quantity": "..."}}],
+      "shopping_list": [{{"name": "...", "quantity": "...", "aisle": "..."}}]
+    }}
+  ]
 }}
 
 Rules:
-- Compute totals across all items (days * servings per day).
+- Compute totals per recipe (days * servings per day).
 - Use pantry items when possible; list only missing ingredients.
 - Only output valid JSON.
 """

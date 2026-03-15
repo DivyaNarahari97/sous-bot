@@ -10,8 +10,6 @@ from sous_bot.api.schemas import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
-    PlanRequest,
-    PlanResponse,
     ShoppingListResponse,
 )
 from sous_bot.planner.engine import PlannerEngine, load_settings
@@ -23,6 +21,8 @@ class SessionState:
     history: list[ChatMessage] = field(default_factory=list)
     last_plan: PlanResponse | None = None
     last_recipe: str | None = None
+    last_shopping_by_recipe: list | None = None
+    last_recipe_names: list[str] | None = None
 
 
 class SessionStore:
@@ -72,17 +72,10 @@ def chat(request: ChatRequest) -> ChatResponse:
     if plan:
         state.last_plan = plan
         state.last_recipe = recipe
+        state.last_recipe_names = recipe.split(", ") if recipe else None
+        state.last_shopping_by_recipe = plan.shopping_list_by_recipe
 
     return ChatResponse(session_id=state.session_id, message=reply, plan=state.last_plan)
-
-
-@app.post("/plan", response_model=PlanResponse)
-def plan(request: PlanRequest) -> PlanResponse:
-    state = store.get_or_create(request.session_id or "default")
-    plan_response = planner_engine.plan(request)
-    state.last_plan = plan_response
-    state.last_recipe = request.recipe
-    return plan_response
 
 
 @app.get("/shopping-list", response_model=ShoppingListResponse)
@@ -93,7 +86,10 @@ def shopping_list(session_id: str | None = None) -> ShoppingListResponse:
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not state.last_plan or not state.last_plan.shopping_list:
+    if not state.last_plan:
         raise HTTPException(status_code=404, detail="No shopping list available")
 
-    return ShoppingListResponse(items=state.last_plan.shopping_list, recipe=state.last_recipe)
+    recipes = state.last_shopping_by_recipe
+    if not recipes:
+        raise HTTPException(status_code=404, detail="No shopping list available")
+    return ShoppingListResponse(recipes=recipes, recipe_names=state.last_recipe_names)

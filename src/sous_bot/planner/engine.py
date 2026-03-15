@@ -20,6 +20,7 @@ from sous_bot.api.schemas import (
     PlanRequest,
     PlanResponse,
     RobotAction,
+    ShoppingListByRecipe,
     ShoppingItem,
 )
 from sous_bot.planner.prompts import CHAT_SYSTEM_PROMPT, MEAL_SUGGESTION_PROMPT, RECIPE_STEPS_PROMPT
@@ -191,6 +192,7 @@ class PlannerEngine:
             missing_ingredients=missing,
             estimated_time=estimated_time,
             shopping_list=shopping_list,
+            shopping_list_by_recipe=[ShoppingListByRecipe(recipe=recipe or "recipe", items=shopping_list)],
             robot_actions=robot_actions,
         )
 
@@ -232,6 +234,7 @@ class PlannerEngine:
             missing_ingredients=missing,
             estimated_time=f"{days} days",
             shopping_list=shopping_list,
+            shopping_list_by_recipe=[ShoppingListByRecipe(recipe=recipe, items=shopping_list)],
             robot_actions=[],
         )
 
@@ -262,18 +265,22 @@ class PlannerEngine:
         )
 
         plan_payload = _extract_json(response_text)
-        missing = [Ingredient(**item) for item in plan_payload.get("missing_ingredients", [])]
-        shopping_list = [ShoppingItem(**item) for item in plan_payload.get("shopping_list", [])]
-        if not shopping_list:
-            shopping_list = [
-                ShoppingItem(name=item.name, quantity=item.quantity or "1", aisle=None) for item in missing
-            ]
+        recipes_payload = plan_payload.get("recipes", [])
+        shopping_by_recipe: list[ShoppingListByRecipe] = []
+        for entry in recipes_payload:
+            recipe_name = entry.get("recipe") or "unknown"
+            items = [ShoppingItem(**item) for item in entry.get("shopping_list", [])]
+            if not items:
+                missing = [Ingredient(**item) for item in entry.get("missing_ingredients", [])]
+                items = [ShoppingItem(name=item.name, quantity=item.quantity or "1", aisle=None) for item in missing]
+            shopping_by_recipe.append(ShoppingListByRecipe(recipe=recipe_name, items=items))
 
         return PlanResponse(
             steps=[],
-            missing_ingredients=missing,
+            missing_ingredients=[],
             estimated_time="weekly plan",
-            shopping_list=shopping_list,
+            shopping_list=None,
+            shopping_list_by_recipe=shopping_by_recipe,
             robot_actions=[],
         )
 

@@ -30,6 +30,11 @@ class ShoppingItem(BaseModel):
     aisle: str | None = None
 
 
+class ShoppingListByRecipe(BaseModel):
+    recipe: str
+    items: list[ShoppingItem]
+
+
 class RobotAction(BaseModel):
     action_type: str
     parameters: dict[str, Any] = Field(default_factory=dict)
@@ -66,9 +71,10 @@ class PlanResponse(BaseModel):
     missing_ingredients: list[Ingredient]
     estimated_time: str
     shopping_list: list[ShoppingItem] | None = None
+    shopping_list_by_recipe: list[ShoppingListByRecipe] | None = None
     robot_actions: list[RobotAction] | None = None
 
 
 class ShoppingListResponse(BaseModel):
-    items: list[ShoppingItem]
-    recipe: str | None = None
+    recipes: list[ShoppingListByRecipe]
+    recipe_names: list[str] | None = None
