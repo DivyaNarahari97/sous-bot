@@ -177,3 +177,33 @@ async def reset_cart() -> dict:
     """Reset the cart for a new shopping trip."""
     _tracker.reset_cart()
     return {"status": "ok", "message": "Cart reset"}
+
+
+# ── Recipe search (Tavily-powered) ───────────────────────────────
+
+
+class RecipeSearchRequest(BaseModel):
+    dish_name: str
+
+
+@router.post("/recipe-ingredients")
+async def get_recipe_ingredients(request: RecipeSearchRequest) -> dict:
+    """Search for a recipe and return its ingredient list (Tavily + LLM)."""
+    from sous_bot.vision.recipe_search import RecipeSearcher
+
+    searcher = RecipeSearcher()
+    ingredients = searcher.get_ingredients_for_dish(request.dish_name)
+    return {"dish": request.dish_name, "ingredients": ingredients}
+
+
+@router.post("/recipe-search")
+async def search_recipes(request: RecipeSearchRequest) -> dict:
+    """Search for recipes via Tavily and return results."""
+    from sous_bot.vision.recipe_search import RecipeSearcher
+
+    searcher = RecipeSearcher()
+    results = searcher.search_recipe(request.dish_name)
+    return {
+        "dish": request.dish_name,
+        "results": [r.model_dump() for r in results],
+    }

@@ -89,7 +89,6 @@ def run_demo_with_viewer(shopping_list: list[ShoppingItem] | None = None) -> Non
     logger.info("Shopping list: %s", [item.name for item in items])
     logger.info("Controls: drag to rotate, scroll to zoom, double-click to track body")
 
-    # Load environment
     env = GroceryStoreEnv()
     env.load()
 
@@ -97,15 +96,11 @@ def run_demo_with_viewer(shopping_list: list[ShoppingItem] | None = None) -> Non
     adapter._ready = True
     controller = RobotController(adapter=adapter)
 
-    # Flag to coordinate between viewer thread and shopping thread
     shopping_done = threading.Event()
     shopping_result = [None]
 
     async def _run_shopping() -> None:
-        """Execute the shopping sequence (runs in a separate thread)."""
-        # Small delay so viewer opens first
         await asyncio.sleep(1.0)
-
         logger.info("Starting shopping run...")
         result = await controller.execute_shopping_list(items)
         shopping_result[0] = result
@@ -125,14 +120,10 @@ def run_demo_with_viewer(shopping_list: list[ShoppingItem] | None = None) -> Non
         asyncio.run(_run_shopping())
         shopping_done.set()
 
-    # Start shopping in background thread
     t = threading.Thread(target=shopping_thread, daemon=True)
     t.start()
 
-    # Launch interactive viewer (blocks until window is closed)
-    # The viewer will show the sim updating in real-time as the robot shops
     mujoco.viewer.launch(env.model, env.data)
-
     env.close()
 
 
@@ -155,25 +146,20 @@ def run_demo_with_passive_viewer(
     controller = RobotController(adapter=adapter)
 
     with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
-        # Set a nice camera angle
         viewer.cam.azimuth = 135
         viewer.cam.elevation = -25
         viewer.cam.distance = 8.0
         viewer.cam.lookat[:] = [3.0, 0.0, 1.0]
 
         async def _run_shopping_with_sync() -> object:
-            """Execute shopping, syncing viewer after each sim step."""
             await asyncio.sleep(0.5)
             logger.info("Starting shopping run...")
-
             result = await controller.execute_shopping_list(items)
-
             logger.info("=" * 60)
             logger.info("Shopping Complete! Fetched: %s", result.items_fetched)
             logger.info("=" * 60)
             return result
 
-        # Override env.step to sync the viewer on each step
         original_step = env.step
 
         def step_with_viewer_sync(n_steps: int = 1) -> None:
@@ -184,7 +170,6 @@ def run_demo_with_passive_viewer(
 
         result = asyncio.run(_run_shopping_with_sync())
 
-        # Keep viewer open after shopping completes
         logger.info("Shopping done. Viewer stays open — close window to exit.")
         while viewer.is_running():
             time.sleep(0.1)
@@ -211,7 +196,6 @@ def run_demo_record(
     adapter._ready = True
     controller = RobotController(adapter=adapter)
 
-    # Collect frames
     frames: list[np.ndarray] = []
     renderer = mujoco.Renderer(env.model, height=720, width=1280)
 
@@ -224,12 +208,10 @@ def run_demo_record(
 
     env.step = step_and_capture  # type: ignore[method-assign]
 
-    # Run shopping
     result = asyncio.run(_run_shopping_for_record(controller, items))
 
     renderer.close()
 
-    # Write video
     if frames:
         try:
             import cv2
@@ -243,7 +225,6 @@ def run_demo_record(
             logger.info("Saved %d frames to %s (%dx%d @ %d fps)",
                          len(frames), output_path, w, h, fps)
         except ImportError:
-            # Fallback: save as numpy
             npy_path = output_path.replace(".mp4", "_frames.npy")
             np.save(npy_path, np.stack(frames))
             logger.info("cv2 not available. Saved %d frames to %s", len(frames), npy_path)
@@ -275,7 +256,6 @@ def main() -> None:
                         help="Custom item names to fetch (e.g., --items pasta eggs milk)")
     args = parser.parse_args()
 
-    # Build shopping list
     shopping_list = None
     if args.items:
         shopping_list = [ShoppingItem(name=name) for name in args.items]

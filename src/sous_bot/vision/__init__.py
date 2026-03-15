@@ -8,6 +8,7 @@ from sous_bot.vision.detector import (
     LocateResult,
 )
 from sous_bot.vision.inventory import CartValidation, IngredientInventory, InventoryTracker
+from sous_bot.vision.recipe_search import RecipeInfo, RecipeSearcher
 
 __all__ = [
     "CameraCapture",
@@ -18,4 +19,6 @@ __all__ = [
     "LocateResult",
     "IngredientInventory",
     "InventoryTracker",
+    "RecipeInfo",
+    "RecipeSearcher",
 ]
