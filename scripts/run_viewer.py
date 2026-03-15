@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""PantryPilot — Full integrated pipeline.
+
+Flow:
+    1. User enters recipes they want to cook
+    2. Nebius LLM extracts all required ingredients
+    3. Ingredients are matched to store inventory
+    4. Robot simulation picks all matched items
+
+Usage:
+    uv run python scripts/run_viewer.py
+    uv run python scripts/run_viewer.py --items pasta eggs milk
+    uv run python scripts/run_viewer.py --skip-llm
+
+Controls:
+    Left-click + drag  : Rotate camera
+    Right-click + drag : Pan camera
+    Scroll             : Zoom in/out
+    Space              : Start/restart shopping sequence
+    R                  : Reset environment
+    Q / ESC            : Quit
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import threading
+import time
+
+import glfw
+import mujoco
+import numpy as np
+from dotenv import load_dotenv
+from openai import OpenAI
+
+from sim.grocery_env import GroceryStoreEnv, STORE_ITEMS
+from sous_bot.robotics.adapters.simulation import SimulationAdapter
+from sous_bot.robotics.controller import RobotController, ShoppingItem
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("pantrypilot")
+
+WIDTH, HEIGHT = 1280, 720
+
+DEMO_SHOPPING_LIST = [
+    ShoppingItem(name="guanciale", quantity="150g", aisle="deli"),
+    ShoppingItem(name="black pepper", quantity="1 tsp", aisle="spices"),
+    ShoppingItem(name="olive oil", quantity="1 bottle", aisle="produce"),
+]
+
+
+# ── Phase 1: Recipe → Ingredients (Nebius LLM) ──────────────────────────────
+
+def get_ingredients_from_recipes(recipes: list[str]) -> list[dict]:
+    """Call Nebius LLM to extract all ingredients from user's recipes."""
+    api_key = os.getenv("NEBIUS_API_KEY")
+    if not api_key:
+        logger.warning("NEBIUS_API_KEY not set — using demo shopping list")
+        return []
+
+    store_item_names = sorted(STORE_ITEMS.keys())
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.studio.nebius.com/v1/",
+    )
+
+    prompt = f"""You are a cooking assistant. The user wants to cook these recipes:
+{', '.join(recipes)}
+
+Here are the items available in our grocery store:
+{', '.join(store_item_names)}
+
+Return a JSON array of ingredients needed. ONLY include items that exist in the store list above.
+For each item, include: name (must exactly match a store item), quantity, and aisle.
+
+Example: [{{"name": "eggs", "quantity": "6", "aisle": "dairy"}}, {{"name": "pasta", "quantity": "500g", "aisle": "bakery"}}]
+
+Return ONLY the JSON array, no other text."""
+
+    logger.info("Asking Nebius LLM for ingredients for: %s", recipes)
+
+    try:
+        response = client.chat.completions.create(
+            model="meta-llama/Llama-3.3-70B-Instruct",
+            messages=[
+                {"role": "system", "content": "You are a precise cooking ingredient extractor. Return only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+    except Exception as e:
+        logger.error("Nebius API call failed: %s", e)
+        return []
+
+    text = response.choices[0].message.content.strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+    try:
+        ingredients = json.loads(text)
+        logger.info("LLM returned %d ingredients", len(ingredients))
+        return ingredients
+    except json.JSONDecodeError:
+        logger.error("Failed to parse LLM response: %s", text[:200])
+        return []
+
+
+# ── Phase 2: Match ingredients to store ──────────────────────────────────────
+
+def match_to_store(ingredients: list[dict]) -> list[ShoppingItem]:
+    """Match LLM ingredients to actual store items."""
+    matched = []
+    store_names = set(STORE_ITEMS.keys())
+
+    for ing in ingredients:
+        name = ing.get("name", "").lower().strip()
+        if name in store_names:
+            info = STORE_ITEMS[name]
+            matched.append(ShoppingItem(
+                name=name,
+                quantity=ing.get("quantity", "1"),
+                aisle=info["aisle"],
+            ))
+        else:
+            # Try fuzzy match — check if store item contains ingredient name or vice versa
+            for store_name in store_names:
+                if name in store_name or store_name in name:
+                    info = STORE_ITEMS[store_name]
+                    matched.append(ShoppingItem(
+                        name=store_name,
+                        quantity=ing.get("quantity", "1"),
+                        aisle=info["aisle"],
+                    ))
+                    break
+            else:
+                logger.warning("Item '%s' not found in store — skipping", name)
+
+    # Deduplicate by name
+    seen = set()
+    unique = []
+    for item in matched:
+        if item.name not in seen:
+            seen.add(item.name)
+            unique.append(item)
+
+    return unique
+
+
+# ── Phase 3: Interactive Viewer + Simulation ─────────────────────────────────
+
+class GroceryViewer:
+    """Interactive GLFW viewer for the grocery sim."""
+
+    def __init__(self, env: GroceryStoreEnv, items: list[ShoppingItem]) -> None:
+        self.env = env
+        self.items = items
+
+        # MuJoCo rendering objects
+        self.scene = mujoco.MjvScene(env.model, maxgeom=5000)
+        self.context: mujoco.MjrContext | None = None
+        self.camera = mujoco.MjvCamera()
+        self.option = mujoco.MjvOption()
+        self.viewport = mujoco.MjrRect(0, 0, WIDTH, HEIGHT)
+
+        # Camera defaults
+        self.camera.azimuth = 145
+        self.camera.elevation = -25
+        self.camera.distance = 8.0
+        self.camera.lookat[:] = [3.0, 0.0, 1.0]
+
+        # Mouse state
+        self._button_left = False
+        self._button_right = False
+        self._button_middle = False
+        self._last_x = 0.0
+        self._last_y = 0.0
+
+        # Shopping state
+        self._shopping_running = False
+        self._shopping_done = False
+        self._status_text = "Press SPACE to start shopping"
+        self._fetched: list[str] = []
+        self._failed: list[str] = []
+        self._current_item: str = ""
+        self._current_step: str = ""
+        self._log_lines: list[str] = []
+        self._pick_notification: str = ""
+        self._pick_notification_time: float = 0.0
+
+    def _mouse_button_callback(self, window, button, act, mods):
+        self._button_left = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+        self._button_right = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+        self._button_middle = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
+        self._last_x, self._last_y = glfw.get_cursor_pos(window)
+
+    def _mouse_move_callback(self, window, xpos, ypos):
+        dx = xpos - self._last_x
+        dy = ypos - self._last_y
+        self._last_x = xpos
+        self._last_y = ypos
+        width, height = glfw.get_window_size(window)
+        mod_shift = glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS
+        if self._button_right:
+            action = mujoco.mjtMouse.mjMOUSE_MOVE_H if mod_shift else mujoco.mjtMouse.mjMOUSE_MOVE_V
+        elif self._button_left:
+            action = mujoco.mjtMouse.mjMOUSE_ROTATE_H if mod_shift else mujoco.mjtMouse.mjMOUSE_ROTATE_V
+        else:
+            return
+        mujoco.mjv_moveCamera(self.env.model, action, dx / width, dy / height,
+                              self.scene, self.camera)
+
+    def _scroll_callback(self, window, xoffset, yoffset):
+        mujoco.mjv_moveCamera(self.env.model, mujoco.mjtMouse.mjMOUSE_ZOOM,
+                              0, -0.15 * yoffset, self.scene, self.camera)
+
+    def _key_callback(self, window, key, scancode, act, mods):
+        if act != glfw.PRESS:
+            return
+        if key in (glfw.KEY_ESCAPE, glfw.KEY_Q):
+            glfw.set_window_should_close(window, True)
+        elif key == glfw.KEY_SPACE:
+            if not self._shopping_running:
+                if self._shopping_done:
+                    self.env.reset()
+                    self._shopping_done = False
+                self._start_shopping()
+        elif key == glfw.KEY_R:
+            self.env.reset()
+            self._shopping_done = False
+            self._shopping_running = False
+            self._status_text = "Environment reset. Press SPACE to start."
+        elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
+            self.camera.distance = max(1.0, self.camera.distance - 1.0)
+        elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
+            self.camera.distance = min(20.0, self.camera.distance + 1.0)
+        elif key == glfw.KEY_UP:
+            self.camera.elevation = min(0, self.camera.elevation + 5)
+        elif key == glfw.KEY_DOWN:
+            self.camera.elevation = max(-90, self.camera.elevation - 5)
+        elif key == glfw.KEY_LEFT:
+            self.camera.azimuth -= 10
+        elif key == glfw.KEY_RIGHT:
+            self.camera.azimuth += 10
+
+    def _log(self, msg: str):
+        """Add a line to the on-screen log (keep last 8 lines)."""
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self._log_lines.append(line)
+        if len(self._log_lines) > 8:
+            self._log_lines = self._log_lines[-8:]
+        logger.info(msg)
+
+    def _show_pick(self, item_name: str):
+        """Flash a pick notification on screen."""
+        self._pick_notification = f"PICKED: {item_name.upper()}"
+        self._pick_notification_time = time.time()
+
+    def _start_shopping(self):
+        self._shopping_running = True
+        self._shopping_done = False
+        self._log_lines = []
+        self._log(f"Starting shopping run for {len(self.items)} items")
+
+        def _run():
+            adapter = SimulationAdapter(env=self.env)
+            adapter._ready = True
+            controller = RobotController(adapter=adapter)
+
+            fetched = []
+            failed = []
+            for i, item in enumerate(self.items):
+                self._current_item = item.name
+                aisle = item.aisle or "unknown"
+
+                self._current_step = "Locating"
+                self._log(f"Looking for {item.name} in {aisle} aisle")
+                self._status_text = f"[{i+1}/{len(self.items)}] Locating {item.name}..."
+
+                self._current_step = "Navigating"
+                self._status_text = f"[{i+1}/{len(self.items)}] Walking to {item.name}..."
+
+                self._current_step = "Reaching"
+
+                self._current_step = "Picking"
+                success = asyncio.run(controller.fetch_item(item.name))
+
+                if success:
+                    fetched.append(item.name)
+                    self._show_pick(item.name)
+                    self._log(f"Picked {item.name} -> cart ({len(fetched)}/{len(self.items)})")
+                else:
+                    failed.append(item.name)
+                    self._log(f"FAILED to get {item.name}")
+
+                self._status_text = f"Cart: {len(fetched)}/{len(self.items)} items"
+
+            self._fetched = fetched
+            self._failed = failed
+            self._current_item = ""
+            self._current_step = ""
+
+            if failed:
+                self._log(f"Done! Got {len(fetched)}, missed {len(failed)}: {failed}")
+            else:
+                self._log(f"Done! All {len(fetched)} items collected!")
+
+            self._status_text = f"Shopping complete! {len(fetched)}/{len(self.items)} items. Press R to reset."
+            self._shopping_done = True
+            self._shopping_running = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def run(self):
+        if not glfw.init():
+            raise RuntimeError("Failed to initialize GLFW")
+
+        window = glfw.create_window(WIDTH, HEIGHT, "PantryPilot — Grocery Shopping Robot", None, None)
+        if not window:
+            glfw.terminate()
+            raise RuntimeError("Failed to create GLFW window")
+
+        glfw.make_context_current(window)
+        glfw.swap_interval(1)
+        glfw.set_mouse_button_callback(window, self._mouse_button_callback)
+        glfw.set_cursor_pos_callback(window, self._mouse_move_callback)
+        glfw.set_scroll_callback(window, self._scroll_callback)
+        glfw.set_key_callback(window, self._key_callback)
+
+        self.context = mujoco.MjrContext(self.env.model, mujoco.mjtFontScale.mjFONTSCALE_150)
+
+        logger.info("Viewer ready. Press SPACE to start shopping, Q to quit.")
+
+        # Auto-start shopping after 1 second
+        auto_start_time = time.time() + 1.0
+        auto_started = False
+
+        while not glfw.window_should_close(window):
+            if not auto_started and time.time() > auto_start_time:
+                auto_started = True
+                self._start_shopping()
+
+            if not self._shopping_running:
+                self.env.step(1)
+
+            fb_width, fb_height = glfw.get_framebuffer_size(window)
+            self.viewport.width = fb_width
+            self.viewport.height = fb_height
+
+            mujoco.mjv_updateScene(
+                self.env.model, self.env.data, self.option, None,
+                self.camera, mujoco.mjtCatBit.mjCAT_ALL, self.scene,
+            )
+            mujoco.mjr_render(self.viewport, self.scene, self.context)
+
+            # ── On-screen overlays ──
+
+            # Bottom-left: status + action log
+            log_text = self._status_text
+            if self._current_item and self._current_step:
+                log_text += f"\n  > {self._current_step}: {self._current_item}"
+            if self._log_lines:
+                log_text += "\n\n" + "\n".join(self._log_lines)
+            mujoco.mjr_overlay(
+                mujoco.mjtFont.mjFONT_NORMAL, mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
+                self.viewport, log_text, "", self.context,
+            )
+
+            # Top-left: shopping list with checkmarks
+            item_lines = "SHOPPING LIST\n" + "-" * 20 + "\n"
+            for i in self.items:
+                if i.name in self._fetched:
+                    mark = "[DONE]"
+                elif i.name == self._current_item:
+                    mark = "[>>>]"
+                else:
+                    mark = "[    ]"
+                item_lines += f" {mark} {i.name}\n"
+            cart_count = len(self._fetched)
+            item_lines += f"\nCart: {cart_count} item{'s' if cart_count != 1 else ''}"
+            mujoco.mjr_overlay(
+                mujoco.mjtFont.mjFONT_NORMAL, mujoco.mjtGridPos.mjGRID_TOPLEFT,
+                self.viewport, item_lines, "", self.context,
+            )
+
+            # Top-right: big pick notification (fades after 2 seconds)
+            if self._pick_notification and (time.time() - self._pick_notification_time) < 2.0:
+                mujoco.mjr_overlay(
+                    mujoco.mjtFont.mjFONT_BIG, mujoco.mjtGridPos.mjGRID_TOPRIGHT,
+                    self.viewport, self._pick_notification, "", self.context,
+                )
+
+            glfw.swap_buffers(window)
+            glfw.poll_events()
+
+        glfw.terminate()
+        self.env.close()
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="PantryPilot — Full Pipeline")
+    parser.add_argument("--items", nargs="+", default=None,
+                        help="Directly specify item names (skip LLM)")
+    parser.add_argument("--skip-llm", action="store_true",
+                        help="Use demo shopping list instead of LLM")
+    args = parser.parse_args()
+
+    if args.items:
+        # Direct item list
+        items = [ShoppingItem(name=name) for name in args.items]
+        print(f"\nDirect items: {[i.name for i in items]}\n")
+    elif args.skip_llm:
+        items = DEMO_SHOPPING_LIST
+        print(f"\nDemo list: {[i.name for i in items]}\n")
+    else:
+        # ── Phase 1: Get recipes from user ──
+        print("\n" + "=" * 60)
+        print("  PantryPilot — What do you want to cook?")
+        print("=" * 60)
+        print("\nEnter the recipes you want to cook (comma-separated):")
+        print("Example: carbonara, stir fry, tacos\n")
+
+        recipe_input = input("> ").strip()
+        if not recipe_input:
+            print("No recipes entered — using demo list")
+            items = DEMO_SHOPPING_LIST
+        else:
+            recipes = [r.strip() for r in recipe_input.split(",")]
+            print(f"\nRecipes: {recipes}")
+
+            # ── Phase 2: LLM extracts ingredients ──
+            print("\nAsking AI for required ingredients...")
+            ingredients = get_ingredients_from_recipes(recipes)
+
+            if not ingredients:
+                print("Could not get ingredients — using demo list")
+                items = DEMO_SHOPPING_LIST
+            else:
+                # ── Phase 3: Match to store ──
+                items = match_to_store(ingredients)
+                if not items:
+                    print("No matching items found in store — using demo list")
+                    items = DEMO_SHOPPING_LIST
+                else:
+                    print(f"\n{'=' * 60}")
+                    print(f"  Shopping List — {len(items)} items to fetch:")
+                    print(f"{'=' * 60}")
+                    for item in items:
+                        print(f"  • {item.name} ({item.quantity}) — {item.aisle} aisle")
+                    print()
+
+    print(f"Starting simulation with {len(items)} items...\n")
+
+    env = GroceryStoreEnv()
+    env.load()
+
+    viewer = GroceryViewer(env, items)
+    viewer.run()
+
+
+if __name__ == "__main__":
+    main()
