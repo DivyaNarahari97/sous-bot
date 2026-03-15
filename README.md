@@ -1,14 +1,14 @@
-# PantryPilot 🤖🛒
+# Sous Bot 🤖🛒
 
 **An assistive grocery robot for visually impaired and elderly users.**
 
-PantryPilot scans your kitchen, understands your meal plan, figures out what's missing, and helps you shop — powered by a Unitree G1 humanoid robot.
+Sous Bot scans your kitchen, understands your meal plan, figures out what's missing, and helps you shop — powered by a Unitree G1 humanoid robot.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   PantryPilot System                 │
+│                   Sous Bot System                    │
 ├─────────────┬──────────────┬────────────────────────┤
 │  PERCEIVE   │    REASON    │         ACT            │
 │             │              │                        │
@@ -37,21 +37,19 @@ PantryPilot scans your kitchen, understands your meal plan, figures out what's m
 ## Project Structure
 
 ```
-pantry-pilot/
+sous-bot/
 ├── README.md
-├── requirements.txt
+├── pyproject.toml
 ├── src/
-│   ├── vision/
-│   │   └── pantry_scanner.py      # Camera → Vision LLM → Inventory
-│   ├── planner/
-│   │   └── meal_planner.py        # Meal plan → Shopping list
-│   ├── voice/
-│   │   └── voice_interface.py     # STT + TTS accessibility layer
-│   ├── robot/
-│   │   └── grocery_navigator.py   # MuJoCo sim / G1 control
-│   └── app.py                     # Main orchestrator
-└── sim/
-    └── grocery_env.py             # MuJoCo grocery store environment
+│   └── sous_bot/
+│       ├── vision/          # Camera → Vision LLM → Inventory
+│       ├── voice/           # STT + TTS accessibility layer
+│       ├── planner/         # Meal plan → Shopping list
+│       ├── robotics/        # MuJoCo sim / G1 control
+│       └── api/             # FastAPI backend
+├── sim/
+│   └── grocery_env.py       # MuJoCo grocery store environment
+└── tests/
 ```
 
 ## Quick Start
@@ -77,8 +75,8 @@ uv sync
 # Copy env file and add your API keys
 cp .env.example .env
 
-# Run the app
-uv run python src/app.py
+# Run the voice assistant
+uv run python -m sous_bot.voice --text
 ```
 
 ## Team

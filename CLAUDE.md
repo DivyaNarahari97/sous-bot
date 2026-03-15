@@ -1,8 +1,8 @@
-# CLAUDE.md — AI Assistant Rules for PantryPilot
+# CLAUDE.md — AI Assistant Rules for Sous Bot
 
 ## Project Overview
 
-PantryPilot: assistive grocery robot for visually impaired/elderly users. Built at Nebius.Build SF Hackathon.
+Sous Bot: assistive grocery robot for visually impaired/elderly users. Built at Nebius.Build SF Hackathon.
 See `docs/steering.md` for full architecture and `TASKS.md` for task assignments.
 
 ## Tech Stack

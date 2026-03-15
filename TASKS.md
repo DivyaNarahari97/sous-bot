@@ -1,4 +1,4 @@
-# PantryPilot — Tasks
+# Sous Bot — Tasks
 
 ## Teammate 1 — AI Planner & Backend API
 
