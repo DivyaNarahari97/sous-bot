@@ -2,14 +2,16 @@
 # API keys should be set in .env, not here
 
 planner:
-  model: "claude-sonnet-4-20250514"
+  provider: "nebius"
+  model: "meta-llama/Llama-3.3-70B-Instruct-fast"
   temperature: 0.3
   max_tokens: 4096
+  nebius_base_url: "https://api.tokenfactory.nebius.com/v1/"
 
 vision:
   camera_index: 0
   detection_confidence_threshold: 0.7
-  model: "yolov8n"  # or huggingface model ID
+  model: "Qwen/Qwen2.5-VL-72B-Instruct"
 
 robotics:
   adapter: "simulation"  # "simulation" or "real"
