@@ -52,7 +52,7 @@ class RoboticsCallback(Protocol):
 # ── Built-in LLM fallback (uses Nebius directly until T1 is ready) ───
 
 ASSISTANT_PROMPT = (
-    "You are PantryPilot, a helpful grocery assistant for visually impaired "
+    "You are Sous Bot, a helpful grocery assistant for visually impaired "
     "and elderly users. You help with meal planning, ingredient tracking, and "
     "grocery shopping. Keep responses SHORT and conversational (2-3 sentences). "
     "Speak naturally as if talking to someone."
@@ -148,7 +148,7 @@ class VoiceAssistant:
 
     def run(self) -> None:
         """Start the interactive voice command loop."""
-        self._say("Hello! I'm PantryPilot. You can say: scan pantry, "
+        self._say("Hello! I'm Sous Bot. You can say: scan pantry, "
                   "plan a meal, what do I need, or just ask me anything. "
                   "Say quit to exit.")
 
@@ -266,7 +266,7 @@ class VoiceAssistant:
 
     def _say(self, text: str) -> None:
         """Speak and print a response."""
-        print(f"\nPantryPilot: {text}")
+        print(f"\nSous Bot: {text}")
         self._tts.speak(text)
 
 

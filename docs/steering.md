@@ -1,8 +1,8 @@
-# PantryPilot — Steering Document
+# Sous Bot — Steering Document
 
 ## Vision
 
-PantryPilot is an assistive grocery robot for visually impaired and elderly users. It scans your kitchen, understands your meal plan, figures out what's missing, and helps you shop — powered by a Unitree G1 humanoid robot and Nebius AI infrastructure.
+Sous Bot is an assistive grocery robot for visually impaired and elderly users. It scans your kitchen, understands your meal plan, figures out what's missing, and helps you shop — powered by a Unitree G1 humanoid robot and Nebius AI infrastructure.
 
 **Hackathon demo target:** "Scan my pantry, plan a meal, tell me what to buy, and show the robot fetching items in simulation."
 
@@ -12,7 +12,7 @@ PantryPilot is an assistive grocery robot for visually impaired and elderly user
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                       PantryPilot System                         │
+│                       Sous Bot System                         │
 ├───────────────┬──────────────────┬───────────────────────────────┤
 │   PERCEIVE    │      REASON      │            ACT                │
 │               │                  │                               │
