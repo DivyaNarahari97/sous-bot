@@ -13,7 +13,7 @@ from sous_bot.vision.detector import IngredientDetector
 from sous_bot.vision.inventory import InventoryTracker
 
 
-# --- Detector tests ---
+# --- Helpers ---
 
 
 def _make_mock_response(content: str) -> MagicMock:
@@ -25,6 +25,9 @@ def _make_mock_response(content: str) -> MagicMock:
     response = MagicMock()
     response.choices = [choice]
     return response
+
+
+# --- Detector tests ---
 
 
 class TestIngredientDetector:
@@ -96,6 +99,65 @@ class TestIngredientDetector:
         assert result.ingredients[0].name == "flour"
 
 
+# --- Shelf locator tests ---
+
+
+class TestShelfLocator:
+    def test_locate_item_found(self) -> None:
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_mock_response(
+            '{"found": true, "position": "middle-left", '
+            '"confidence": 0.92, "description": "red box of pasta"}'
+        )
+        with patch("sous_bot.vision.detector.OpenAI", return_value=mock_client):
+            detector = IngredientDetector(api_key="test-key")
+            result = detector.locate_item_on_shelf(b"fake-shelf-image", "pasta")
+
+        assert result.found is True
+        assert result.item_name == "pasta"
+        assert result.position == "middle-left"
+        assert result.confidence == 0.92
+        assert "pasta" in result.description
+
+    def test_locate_item_not_found(self) -> None:
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_mock_response(
+            '{"found": false, "position": "", '
+            '"confidence": 0.0, "description": "item not visible on shelf"}'
+        )
+        with patch("sous_bot.vision.detector.OpenAI", return_value=mock_client):
+            detector = IngredientDetector(api_key="test-key")
+            result = detector.locate_item_on_shelf(b"fake-shelf-image", "guanciale")
+
+        assert result.found is False
+        assert result.item_name == "guanciale"
+
+    def test_locate_handles_markdown_wrapped(self) -> None:
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_mock_response(
+            '```json\n{"found": true, "position": "top-right", '
+            '"confidence": 0.88, "description": "bottle of olive oil"}\n```'
+        )
+        with patch("sous_bot.vision.detector.OpenAI", return_value=mock_client):
+            detector = IngredientDetector(api_key="test-key")
+            result = detector.locate_item_on_shelf(b"fake-shelf-image", "olive oil")
+
+        assert result.found is True
+        assert result.position == "top-right"
+
+    def test_locate_handles_malformed_response(self) -> None:
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_mock_response(
+            "I cannot see that item clearly."
+        )
+        with patch("sous_bot.vision.detector.OpenAI", return_value=mock_client):
+            detector = IngredientDetector(api_key="test-key")
+            result = detector.locate_item_on_shelf(b"fake-shelf-image", "milk")
+
+        assert result.found is False
+        assert result.item_name == "milk"
+
+
 # --- Inventory tracker tests ---
 
 
@@ -143,12 +205,65 @@ class TestInventoryTracker:
         assert inv.missing == []
 
 
+# --- Cart validation tests ---
+
+
+class TestCartValidation:
+    def test_cart_add_and_validate(self) -> None:
+        tracker = InventoryTracker()
+        tracker.update_available(["pasta", "eggs"])
+        tracker.set_needed(["pasta", "eggs", "guanciale", "black pepper"])
+
+        # Robot picks up guanciale
+        result = tracker.add_to_cart("guanciale")
+        assert not result.complete
+        assert "guanciale" in result.collected
+        assert "black pepper" in result.remaining
+        assert "1/2" in result.message
+
+    def test_cart_complete(self) -> None:
+        tracker = InventoryTracker()
+        tracker.update_available(["pasta"])
+        tracker.set_needed(["pasta", "milk", "butter"])
+
+        tracker.add_to_cart("milk")
+        result = tracker.add_to_cart("butter")
+        assert result.complete is True
+        assert result.remaining == []
+        assert "Requirements met" in result.message
+
+    def test_cart_validate_no_items_needed(self) -> None:
+        tracker = InventoryTracker()
+        tracker.update_available(["milk", "eggs"])
+        tracker.set_needed(["milk", "eggs"])
+
+        result = tracker.validate_cart()
+        assert not result.complete  # nothing to shop for
+        assert "fully stocked" in result.message
+
+    def test_cart_reset(self) -> None:
+        tracker = InventoryTracker()
+        tracker.set_needed(["milk", "eggs"])
+        tracker.add_to_cart("milk")
+        tracker.reset_cart()
+
+        result = tracker.validate_cart()
+        assert "milk" in result.remaining
+
+    def test_shopping_list(self) -> None:
+        tracker = InventoryTracker()
+        tracker.update_available(["pasta", "rice"])
+        tracker.set_needed(["pasta", "rice", "chicken", "soy sauce"])
+
+        items = tracker.get_shopping_list()
+        assert items == ["chicken", "soy sauce"]
+
+
 # --- Camera tests ---
 
 
 class TestCameraCapture:
     def test_load_image_from_file(self, tmp_path: Path) -> None:
-        # Create a minimal valid image file
         img = np.zeros((10, 10, 3), dtype=np.uint8)
         import cv2
 
@@ -162,3 +277,65 @@ class TestCameraCapture:
     def test_load_image_not_found(self) -> None:
         with pytest.raises(FileNotFoundError):
             CameraCapture.load_image("/nonexistent/image.jpg")
+
+
+# --- FastAPI route tests ---
+
+
+class TestVisionRoutes:
+    @pytest.fixture
+    def client(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from sous_bot.vision.routes import router
+
+        app = FastAPI()
+        app.include_router(router)
+        return TestClient(app)
+
+    def test_get_ingredients_empty(self, client) -> None:
+        resp = client.get("/vision/ingredients")
+        assert resp.status_code == 200
+        assert resp.json()["ingredients"] == []
+
+    def test_get_inventory(self, client) -> None:
+        resp = client.get("/vision/inventory")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "available" in data
+        assert "needed" in data
+        assert "missing" in data
+
+    def test_set_needed(self, client) -> None:
+        resp = client.post(
+            "/vision/inventory/needed",
+            json={"ingredients": ["milk", "eggs", "flour"]},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "milk" in data["needed"]
+
+    def test_cart_add_and_validate(self, client) -> None:
+        # Set up needed items
+        client.post(
+            "/vision/inventory/needed",
+            json={"ingredients": ["chicken"]},
+        )
+        # Add to cart
+        resp = client.post("/vision/cart/add", json={"item": "chicken"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["complete"] is True
+
+    def test_cart_reset(self, client) -> None:
+        resp = client.post("/vision/cart/reset")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    def test_scan_empty_file(self, client) -> None:
+        resp = client.post(
+            "/vision/scan",
+            files={"file": ("test.jpg", b"", "image/jpeg")},
+        )
+        assert resp.status_code == 400
