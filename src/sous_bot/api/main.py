@@ -10,6 +10,7 @@ from sous_bot.api.schemas import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
+    PlanResponse,
     ShoppingListResponse,
 )
 from sous_bot.planner.engine import PlannerEngine, load_settings
@@ -93,3 +94,9 @@ def shopping_list(session_id: str | None = None) -> ShoppingListResponse:
     if not recipes:
         raise HTTPException(status_code=404, detail="No shopping list available")
     return ShoppingListResponse(recipes=recipes, recipe_names=state.last_recipe_names)
+
+
+@app.get("/generate-shopping-list", response_model=ShoppingListResponse)
+def generate_shopping_list(session_id: str | None = None) -> ShoppingListResponse:
+    """Alias for /shopping-list."""
+    return shopping_list(session_id=session_id)

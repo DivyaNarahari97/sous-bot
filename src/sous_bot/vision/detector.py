@@ -30,6 +30,8 @@ class LocateResult(BaseModel):
     found: bool = False
     item_name: str = ""
     position: str = ""  # e.g. "top-left", "middle-center", "bottom-right"
+    pixel_x: int = -1  # Pixel X coordinate (center of item in image)
+    pixel_y: int = -1  # Pixel Y coordinate (center of item in image)
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
     description: str = ""
     raw_response: str = ""
@@ -37,20 +39,29 @@ class LocateResult(BaseModel):
 
 VISION_PROMPT = (
     "You are a pantry inventory assistant. Analyze this image and identify all "
-    "visible food ingredients, groceries, and pantry items. Return a JSON array "
-    "where each element has 'name' (string, lowercase) and 'confidence' (float "
-    "0-1). Only include items you can clearly identify. Example: "
+    "visible food ingredients, groceries, and pantry items. "
+    "IMPORTANT: List each individual product SEPARATELY. Do not combine adjacent "
+    "items into one name. For example, 'beef' and 'yogurt' are two separate items, "
+    "not 'beef yogurt'. Each name should be a single product. "
+    "Return a JSON array "
+    "where each element has 'name' (string, lowercase, one product per entry) and "
+    "'confidence' (float 0-1). Only include items you can clearly identify. Example: "
     '[{"name": "milk", "confidence": 0.95}, {"name": "eggs", "confidence": 0.9}]'
 )
 
 SHELF_LOCATE_PROMPT = (
     "You are a grocery store shelf scanner for an assistive robot. "
+    "The image is {width}x{height} pixels. "
     "Look at this shelf image and find the item: '{item_name}'. "
     "Return a JSON object with: "
-    "'found' (bool), 'position' (string: top-left/top-center/top-right/"
+    "'found' (bool), "
+    "'pixel_x' (int, X pixel coordinate of the CENTER of the item), "
+    "'pixel_y' (int, Y pixel coordinate of the CENTER of the item), "
+    "'position' (string: top-left/top-center/top-right/"
     "middle-left/middle-center/middle-right/bottom-left/bottom-center/bottom-right), "
     "'confidence' (float 0-1), 'description' (brief visual description of the item). "
-    'Example: {{"found": true, "position": "middle-left", "confidence": 0.92, '
+    'Example: {{"found": true, "pixel_x": 320, "pixel_y": 240, '
+    '"position": "middle-center", "confidence": 0.92, '
     '"description": "red box of pasta on second shelf"}}'
 )
 
@@ -84,12 +95,15 @@ class IngredientDetector:
             return self.detect_from_bytes(f.read())
 
     def locate_item_on_shelf(
-        self, image_bytes: bytes, item_name: str
+        self, image_bytes: bytes, item_name: str,
+        width: int = 640, height: int = 480,
     ) -> LocateResult:
         """Locate a specific item on a grocery shelf image (robot's eyes)."""
         b64 = base64.b64encode(image_bytes).decode("utf-8")
         image_url = f"data:image/jpeg;base64,{b64}"
-        prompt = SHELF_LOCATE_PROMPT.format(item_name=item_name)
+        prompt = SHELF_LOCATE_PROMPT.format(
+            item_name=item_name, width=width, height=height,
+        )
 
         response = self._client.chat.completions.create(
             model=self._model,
@@ -127,6 +141,8 @@ class IngredientDetector:
         return LocateResult(
             found=bool(data.get("found", False)),
             item_name=item_name,
+            pixel_x=int(data.get("pixel_x") or -1),
+            pixel_y=int(data.get("pixel_y") or -1),
             position=str(data.get("position", "")),
             confidence=float(data.get("confidence", 0.0)),
             description=str(data.get("description", "")),

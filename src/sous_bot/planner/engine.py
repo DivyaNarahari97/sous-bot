@@ -72,7 +72,7 @@ def load_planner_config() -> PlannerConfig:
         max_tokens=int(planner.get("max_tokens", 2048)),
         minimax_base_url=planner.get("minimax_base_url", "https://api.minimax.io/v1"),
         minimax_api_key=api_key,
-        nebius_base_url=planner.get("nebius_base_url", "https://api.tokenfactory.nebius.com/v1/"),
+        nebius_base_url=planner.get("nebius_base_url", "https://api.studio.nebius.com/v1/"),
         nebius_api_key=nebius_key,
     )
 

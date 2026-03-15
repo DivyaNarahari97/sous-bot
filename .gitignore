@@ -7,3 +7,6 @@ __pycache__/
 dist/
 build/
 .venv/
+GroceryStoreDataset-master/
+*.demo_*.png
+demo_*.png

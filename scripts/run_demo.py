@@ -1,271 +1,274 @@
 #!/usr/bin/env python3
-"""Sous Bot — Hackathon Demo Script.
-
-Runs the full 3-phase flow:
-  Phase 1: User says what they want to cook → T1 planner generates recipe + ingredients
-  Phase 2: Vision scans pantry → detects available → computes missing → shopping list
-  Phase 3: Simulated robot fetches items → cart validates → "requirements met!"
+"""PantryPilot demo — full grocery shopping sequence in MuJoCo simulation.
 
 Usage:
-  # Full demo with voice TTS (speaks everything aloud)
-  uv run python scripts/run_demo.py
-
-  # Silent mode (text only, no TTS)
-  uv run python scripts/run_demo.py --silent
-
-  # With a real pantry image
-  uv run python scripts/run_demo.py --image path/to/pantry.jpg
-
-  # Interactive mode (lets you type commands after the scripted demo)
-  uv run python scripts/run_demo.py --interactive
+    python scripts/run_demo.py              # headless (logs only)
+    python scripts/run_demo.py --viewer     # interactive 3D viewer (for live demo)
+    python scripts/run_demo.py --record     # save video to demo_output.mp4
 """
 
 from __future__ import annotations
 
-import os
+import argparse
+import asyncio
+import logging
 import sys
+import threading
 import time
 
-from dotenv import load_dotenv
+import mujoco
+import mujoco.viewer
+import numpy as np
 
-load_dotenv()
+from sim.grocery_env import GroceryStoreEnv
+from sous_bot.robotics.adapters.simulation import SimulationAdapter
+from sous_bot.robotics.controller import RobotController, ShoppingItem
 
-# ── Helpers ───────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("demo")
 
-SILENT = "--silent" in sys.argv
-TTS_ENGINE = None
-
-
-def say(text: str, pause: float = 0.5) -> None:
-    """Print and optionally speak text."""
-    print(f"\n🤖 Sous Bot: {text}")
-    if not SILENT:
-        global TTS_ENGINE
-        if TTS_ENGINE is None:
-            from sous_bot.voice.tts import TextToSpeech
-            TTS_ENGINE = TextToSpeech()
-        TTS_ENGINE.speak(text)
-    time.sleep(pause)
-
-
-def banner(phase: str) -> None:
-    """Print a phase banner."""
-    print(f"\n{'='*60}")
-    print(f"  {phase}")
-    print(f"{'='*60}")
+# Sample shopping list — what the planner would generate for carbonara
+DEMO_SHOPPING_LIST = [
+    ShoppingItem(name="guanciale", quantity="150g", aisle="deli"),
+    ShoppingItem(name="black pepper", quantity="1 tsp", aisle="spices"),
+    ShoppingItem(name="olive oil", quantity="1 bottle", aisle="produce"),
+]
 
 
-def user_says(text: str) -> None:
-    """Simulate user speech."""
-    print(f"\n🎤 User: \"{text}\"")
-    time.sleep(0.3)
+async def run_demo_headless(
+    shopping_list: list[ShoppingItem] | None = None,
+) -> object:
+    """Run the full grocery shopping demo (headless)."""
+    items = shopping_list or DEMO_SHOPPING_LIST
+
+    logger.info("=" * 60)
+    logger.info("PantryPilot — Grocery Shopping Demo")
+    logger.info("=" * 60)
+    logger.info("Shopping list: %s", [item.name for item in items])
+
+    env = GroceryStoreEnv()
+    adapter = SimulationAdapter(env=env)
+    await adapter.initialize()
+
+    controller = RobotController(adapter=adapter)
+
+    status = await adapter.status()
+    logger.info("Robot status: ready=%s, position=%s", status.is_ready, status.robot_position)
+
+    logger.info("-" * 60)
+    logger.info("Starting shopping run...")
+    logger.info("-" * 60)
+
+    result = await controller.execute_shopping_list(items)
+
+    logger.info("=" * 60)
+    logger.info("Shopping Run Complete!")
+    logger.info("  Items fetched: %s", result.items_fetched)
+    logger.info("  Items failed:  %s", result.items_failed)
+    logger.info("  Total actions: %d", len(result.action_log))
+    logger.info("  Success:       %s", result.completed)
+    logger.info("=" * 60)
+
+    final_status = await adapter.status()
+    logger.info("Cart contents: %s", final_status.items_in_cart)
+
+    env.close()
+    return result
 
 
-# ── Phase 1: Meal Planning (T1 Planner) ──────────────────────────
+def run_demo_with_viewer(shopping_list: list[ShoppingItem] | None = None) -> None:
+    """Run the demo with MuJoCo's interactive 3D viewer for live judging."""
+    items = shopping_list or DEMO_SHOPPING_LIST
 
-def phase1_plan_meals() -> list[str]:
-    """User requests meals → T1 planner generates ingredient list."""
-    banner("PHASE 1: What do I want to cook?")
+    logger.info("=" * 60)
+    logger.info("PantryPilot — Interactive Grocery Shopping Demo")
+    logger.info("=" * 60)
+    logger.info("Shopping list: %s", [item.name for item in items])
+    logger.info("Controls: drag to rotate, scroll to zoom, double-click to track body")
 
-    user_says("I want to make carbonara and a stir fry this week")
-    say("Great choices! Let me plan those meals for you...")
+    env = GroceryStoreEnv()
+    env.load()
 
-    from sous_bot.planner.engine import PlannerEngine
-    planner = PlannerEngine()
+    adapter = SimulationAdapter(env=env)
+    adapter._ready = True
+    controller = RobotController(adapter=adapter)
 
-    # Use T1 planner to generate ingredients
-    from sous_bot.api.schemas import ChatMessage
-    history: list[ChatMessage] = []
-    reply, plan, recipe = planner.chat_with_plan(
-        history,
-        "I want to make carbonara and chicken stir fry. "
-        "List ALL ingredients I need for both recipes.",
-        [],
-    )
+    shopping_done = threading.Event()
+    shopping_result = [None]
 
-    say(reply)
+    async def _run_shopping() -> None:
+        await asyncio.sleep(1.0)
+        logger.info("Starting shopping run...")
+        result = await controller.execute_shopping_list(items)
+        shopping_result[0] = result
 
-    # Extract needed ingredients from the plan or use fallback
-    if plan and plan.shopping_list:
-        needed = [item.name for item in plan.shopping_list]
-        say(f"You'll need {len(needed)} ingredients total across both recipes.")
-    else:
-        # Fallback: common ingredients for these recipes
-        needed = [
-            "pasta", "eggs", "guanciale", "parmesan", "black pepper",
-            "olive oil", "chicken", "soy sauce", "ginger", "bell pepper",
-            "rice", "garlic", "sesame oil",
-        ]
-        say(f"For carbonara and stir fry, you'll need about {len(needed)} ingredients.")
+        logger.info("=" * 60)
+        logger.info("Shopping Run Complete!")
+        logger.info("  Items fetched: %s", result.items_fetched)
+        logger.info("  Items failed:  %s", result.items_failed)
+        logger.info("  Success:       %s", result.completed)
+        logger.info("=" * 60)
 
-    return needed
+        final_status = await adapter.status()
+        logger.info("Cart contents: %s", final_status.items_in_cart)
+        logger.info("Close the viewer window to exit.")
 
+    def shopping_thread() -> None:
+        asyncio.run(_run_shopping())
+        shopping_done.set()
 
-# ── Phase 2: Pantry Scan (T3 Vision) ─────────────────────────────
+    t = threading.Thread(target=shopping_thread, daemon=True)
+    t.start()
 
-def phase2_scan_pantry(
-    needed: list[str], image_path: str | None = None,
-) -> list[str]:
-    """Scan pantry → detect ingredients → compute missing."""
-    banner("PHASE 2: What do I already have?")
-
-    from sous_bot.vision.detector import IngredientDetector
-    from sous_bot.vision.inventory import InventoryTracker
-
-    tracker = InventoryTracker()
-    detected_names: list[str] = []
-
-    if image_path:
-        user_says("Here's my pantry, take a look")
-        say("Scanning your pantry with the camera...")
-
-        from sous_bot.vision.camera import CameraCapture
-        image_bytes = CameraCapture.load_image(image_path)
-
-        detector = IngredientDetector()
-        result = detector.detect_from_bytes(image_bytes)
-
-        if result.ingredients:
-            detected_names = [i.name for i in result.ingredients]
-            items_str = ", ".join(detected_names)
-            say(f"I can see {len(detected_names)} items: {items_str}.")
-        else:
-            say("Hmm, I couldn't detect much. Let me use some defaults.")
-
-    if not detected_names:
-        # Demo fallback: simulate a pantry scan
-        user_says("Let me show you my pantry")
-        say("Scanning your pantry...")
-        time.sleep(1)
-
-        detected_names = ["pasta", "eggs", "parmesan", "rice", "soy sauce", "garlic"]
-        items_str = ", ".join(detected_names)
-        say(f"I can see {len(detected_names)} items: {items_str}.")
-
-    # Compute missing
-    tracker.update_available(detected_names)
-    tracker.set_needed(needed)
-    inv = tracker.get_inventory()
-
-    if inv.missing:
-        say(f"You're missing {len(inv.missing)} items: {', '.join(inv.missing)}.")
-    else:
-        say("You have everything you need!")
-
-    return inv.missing
+    mujoco.viewer.launch(env.model, env.data)
+    env.close()
 
 
-# ── Phase 3: Robot Shopping (T2 Simulated) ────────────────────────
+def run_demo_with_passive_viewer(
+    shopping_list: list[ShoppingItem] | None = None,
+) -> None:
+    """Run demo with passive viewer — shopping drives the sim, viewer just watches."""
+    items = shopping_list or DEMO_SHOPPING_LIST
 
-def phase3_robot_shopping(missing: list[str]) -> None:
-    """Simulated robot fetches items from grocery store."""
-    banner("PHASE 3: Go shopping!")
+    logger.info("=" * 60)
+    logger.info("PantryPilot — Passive Viewer Demo")
+    logger.info("=" * 60)
+    logger.info("Shopping list: %s", [item.name for item in items])
 
-    if not missing:
-        say("No shopping needed — your pantry is fully stocked!")
-        return
+    env = GroceryStoreEnv()
+    env.load()
 
-    from sous_bot.vision.inventory import InventoryTracker
+    adapter = SimulationAdapter(env=env)
+    adapter._ready = True
+    controller = RobotController(adapter=adapter)
 
-    tracker = InventoryTracker()
-    tracker.set_needed(missing)  # Only missing items need fetching
+    with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
+        viewer.cam.azimuth = 135
+        viewer.cam.elevation = -25
+        viewer.cam.distance = 8.0
+        viewer.cam.lookat[:] = [3.0, 0.0, 1.0]
 
-    user_says("Show me the shopping")
-    say(f"Sending the robot to fetch {len(missing)} items. Let's go!")
+        async def _run_shopping_with_sync() -> object:
+            await asyncio.sleep(0.5)
+            logger.info("Starting shopping run...")
+            result = await controller.execute_shopping_list(items)
+            logger.info("=" * 60)
+            logger.info("Shopping Complete! Fetched: %s", result.items_fetched)
+            logger.info("=" * 60)
+            return result
 
-    # Simulated store aisles
-    aisle_map = {
-        "guanciale": "deli", "chicken": "deli", "ground beef": "deli",
-        "black pepper": "spices", "ginger": "spices", "garlic": "spices",
-        "olive oil": "oils", "sesame oil": "oils",
-        "bell pepper": "produce", "lettuce": "produce", "onion": "produce",
-        "tortillas": "bakery", "cheese": "dairy", "butter": "dairy",
-        "soy sauce": "condiments", "salsa": "condiments",
-    }
+        original_step = env.step
 
-    for i, item in enumerate(missing, 1):
-        aisle = aisle_map.get(item, "aisle 3")
+        def step_with_viewer_sync(n_steps: int = 1) -> None:
+            original_step(n_steps)
+            viewer.sync()
 
-        # Step 3a: Navigate
-        print(f"\n  📍 [{i}/{len(missing)}] Navigating to {aisle} section...")
-        time.sleep(0.3)
+        env.step = step_with_viewer_sync  # type: ignore[method-assign]
 
-        # Step 3b: Vision locates item
-        print(f"  👁️  Scanning shelf... Found {item}!")
-        time.sleep(0.2)
+        result = asyncio.run(_run_shopping_with_sync())
 
-        # Step 3c: Reach and grasp
-        print(f"  🦾 Reaching for {item}... Grasped!")
-        time.sleep(0.2)
+        logger.info("Shopping done. Viewer stays open — close window to exit.")
+        while viewer.is_running():
+            time.sleep(0.1)
 
-        # Step 3d: Place in cart
-        result = tracker.add_to_cart(item)
-        print(f"  🛒 Placed {item} in cart. ({len(result.collected)}/{len(missing)})")
-        time.sleep(0.2)
-
-        if not result.complete:
-            remaining = ", ".join(result.remaining)
-            print(f"     Still need: {remaining}")
-
-    # Step 3e: Validate
-    print()
-    result = tracker.validate_cart()
-    if result.complete:
-        say(f"Shopping complete! Got all {len(result.collected)} items. "
-            "All requirements met! Heading to checkout.")
-    else:
-        say(f"Almost done. Still missing: {', '.join(result.remaining)}.")
+    env.close()
 
 
-# ── Main Demo ─────────────────────────────────────────────────────
+def run_demo_record(
+    shopping_list: list[ShoppingItem] | None = None,
+    output_path: str = "demo_output.mp4",
+    fps: int = 30,
+) -> None:
+    """Record the demo to an MP4 video file."""
+    items = shopping_list or DEMO_SHOPPING_LIST
+
+    logger.info("=" * 60)
+    logger.info("PantryPilot — Recording Demo to %s", output_path)
+    logger.info("=" * 60)
+
+    env = GroceryStoreEnv()
+    env.load()
+
+    adapter = SimulationAdapter(env=env)
+    adapter._ready = True
+    controller = RobotController(adapter=adapter)
+
+    frames: list[np.ndarray] = []
+    renderer = mujoco.Renderer(env.model, height=720, width=1280)
+
+    original_step = env.step
+
+    def step_and_capture(n_steps: int = 1) -> None:
+        original_step(n_steps)
+        renderer.update_scene(env.data)
+        frames.append(renderer.render().copy())
+
+    env.step = step_and_capture  # type: ignore[method-assign]
+
+    result = asyncio.run(_run_shopping_for_record(controller, items))
+
+    renderer.close()
+
+    if frames:
+        try:
+            import cv2
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            h, w = frames[0].shape[:2]
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            for frame in frames:
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            writer.release()
+            logger.info("Saved %d frames to %s (%dx%d @ %d fps)",
+                         len(frames), output_path, w, h, fps)
+        except ImportError:
+            npy_path = output_path.replace(".mp4", "_frames.npy")
+            np.save(npy_path, np.stack(frames))
+            logger.info("cv2 not available. Saved %d frames to %s", len(frames), npy_path)
+
+    env.close()
+    logger.info("Items fetched: %s", result.items_fetched)
+
+
+async def _run_shopping_for_record(
+    controller: RobotController,
+    items: list[ShoppingItem],
+) -> object:
+    await asyncio.sleep(0.01)
+    return await controller.execute_shopping_list(items)
+
 
 def main() -> None:
-    print("""
-╔══════════════════════════════════════════════════════╗
-║                                                      ║
-║           🤖  SOUS BOT — Hackathon Demo  🛒          ║
-║                                                      ║
-║   Assistive grocery robot for visually impaired      ║
-║   and elderly users. Built at Nebius.Build SF.       ║
-║                                                      ║
-╚══════════════════════════════════════════════════════╝
-    """)
+    parser = argparse.ArgumentParser(description="PantryPilot Grocery Shopping Demo")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--viewer", action="store_true",
+                      help="Launch interactive 3D viewer (for live demo)")
+    mode.add_argument("--passive", action="store_true",
+                      help="Launch passive viewer with auto camera")
+    mode.add_argument("--record", action="store_true",
+                      help="Record demo to MP4 video")
+    parser.add_argument("--output", default="demo_output.mp4",
+                        help="Output video path (with --record)")
+    parser.add_argument("--items", nargs="+", default=None,
+                        help="Custom item names to fetch (e.g., --items pasta eggs milk)")
+    args = parser.parse_args()
 
-    say("Hello! I'm Sous Bot, your personal grocery assistant. "
-        "Let me show you what I can do.", pause=1.0)
+    shopping_list = None
+    if args.items:
+        shopping_list = [ShoppingItem(name=name) for name in args.items]
 
-    # Get image path if provided
-    image_path = None
-    for i, arg in enumerate(sys.argv):
-        if arg == "--image" and i + 1 < len(sys.argv):
-            image_path = sys.argv[i + 1]
-
-    # Phase 1: Plan meals
-    needed = phase1_plan_meals()
-
-    # Phase 2: Scan pantry
-    missing = phase2_scan_pantry(needed, image_path)
-
-    # Phase 3: Robot shopping
-    phase3_robot_shopping(missing)
-
-    # Wrap up
-    banner("DEMO COMPLETE")
-    say("That's the full Sous Bot flow! "
-        "Voice in, vision scan, AI planning, and robot shopping. "
-        "Thank you for watching!", pause=1.5)
-
-    # Optional interactive mode
-    if "--interactive" in sys.argv:
-        print("\n--- Entering interactive mode (type 'quit' to exit) ---")
-        from sous_bot.voice.assistant import VoiceAssistant
-        assistant = VoiceAssistant(use_mic=False)
-        # Pre-load the inventory state
-        for item in (needed or []):
-            assistant._inventory.add_available(item) if item not in (missing or []) else None
-        if needed:
-            assistant._inventory.set_needed(needed)
-        assistant.run()
+    if args.viewer:
+        run_demo_with_viewer(shopping_list)
+    elif args.passive:
+        run_demo_with_passive_viewer(shopping_list)
+    elif args.record:
+        run_demo_record(shopping_list, output_path=args.output)
+    else:
+        result = asyncio.run(run_demo_headless(shopping_list))
+        sys.exit(0 if result.completed else 1)
 
 
 if __name__ == "__main__":
