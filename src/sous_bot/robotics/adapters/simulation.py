@@ -51,12 +51,14 @@ def _smooth(frac: float) -> float:
 class SimulationAdapter(RobotAdapter):
     """Robot adapter backed by MuJoCo simulation with real Unitree G1."""
 
-    def __init__(self, env: GroceryStoreEnv | None = None) -> None:
+    def __init__(self, env: GroceryStoreEnv | None = None, use_vision: bool = True) -> None:
         self.env = env or GroceryStoreEnv()
         self._current_action: RobotAction | None = None
         self._items_in_cart: list[str] = []
         self._held_item: str | None = None
         self._ready = False
+        self._use_vision = use_vision
+        self._detector = None  # Lazy-loaded VLM detector
 
     async def initialize(self) -> None:
         """Load the environment and mark adapter as ready."""
@@ -85,7 +87,7 @@ class SimulationAdapter(RobotAdapter):
         )
 
     async def locate_item(self, item_name: str, parameters: dict | None = None) -> ActionResult:
-        """Locate an item in the store."""
+        """Locate an item in the store (lookup only — VLM scan happens at shelf)."""
         action = RobotAction(action="locate", target=item_name, parameters=parameters or {})
         self._current_action = action
 
@@ -98,15 +100,60 @@ class SimulationAdapter(RobotAdapter):
         self._current_action = None
         return ActionResult(
             action=action, status=ActionStatus.COMPLETED,
-            message=f"Located {item_name} in {item_info['aisle']} aisle, shelf {item_info['shelf']}",
+            message=f"Located {item_name} in {item_info['aisle']} aisle",
             data={"aisle": item_info["aisle"], "shelf": item_info["shelf"],
                   "position": item_pos.tolist() if item_pos is not None else None},
         )
+
+    async def _vision_locate(self, item_name: str) -> bool:
+        """Use Qwen2.5-VL to visually confirm an item on the shelf."""
+        try:
+            # Lazy-load the detector
+            if self._detector is None:
+                from sous_bot.vision.detector import IngredientDetector
+                self._detector = IngredientDetector()
+                logger.info("VLM vision detector initialized (Qwen2.5-VL)")
+
+            # Capture what the robot sees
+            image_bytes = self.env.render_robot_view_jpeg()
+            if image_bytes is None:
+                logger.warning("Could not capture robot view")
+                return False
+
+            # Ask VLM: "Do you see this item on the shelf?"
+            logger.info("VLM scanning shelf for '%s'...", item_name)
+            result = await asyncio.to_thread(
+                self._detector.locate_item_on_shelf, image_bytes, item_name
+            )
+
+            if result.found and result.confidence >= 0.5:
+                logger.info(
+                    "VLM found '%s' at %s (confidence: %.2f) — %s",
+                    item_name, result.position, result.confidence, result.description,
+                )
+                return True
+            else:
+                logger.info(
+                    "VLM did not confidently find '%s' (found=%s, conf=%.2f)",
+                    item_name, result.found, result.confidence,
+                )
+                return False
+        except Exception as e:
+            logger.warning("VLM vision failed: %s — proceeding without vision", e)
+            return False
 
     async def reach(self, target: str, parameters: dict | None = None) -> ActionResult:
         """Reach arm toward an item using IK to target the exact item position."""
         action = RobotAction(action="reach", target=target, parameters=parameters or {})
         self._current_action = action
+
+        # VLM scan: robot is at the shelf now — use vision to confirm item
+        if self._use_vision:
+            found = await self._vision_locate(target)
+            if found:
+                logger.info("VLM confirmed '%s' on shelf — reaching", target)
+            else:
+                logger.info("VLM did not confirm '%s' — reaching by store lookup", target)
 
         item_pos = self.env.get_item_position(target)
         if item_pos is None:

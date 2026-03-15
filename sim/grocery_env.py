@@ -810,6 +810,51 @@ class GroceryStoreEnv:
         self.renderer.update_scene(self.data)
         return self.renderer.render()
 
+    def render_robot_view(self, width: int = 640, height: int = 480) -> np.ndarray | None:
+        """Render from the robot's perspective — what it 'sees' looking forward.
+
+        Camera is placed at head height, looking in the robot's facing direction.
+        Returns RGB numpy array (JPEG-encodable).
+        """
+        if self.model is None or self.data is None:
+            return None
+        import math
+
+        renderer = mujoco.Renderer(self.model, height=height, width=width)
+        camera = mujoco.MjvCamera()
+
+        # Robot position and heading
+        robot_pos = self.get_robot_position()
+        # Extract yaw from quaternion qpos[3:7]
+        w, x, y, z = self.data.qpos[3], self.data.qpos[4], self.data.qpos[5], self.data.qpos[6]
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+        # Camera at head height, looking forward
+        head_height = 1.4  # G1 is ~1.3m tall, camera slightly above
+        look_dist = 1.5    # Look 1.5m ahead
+
+        camera.lookat[0] = robot_pos[0] + look_dist * math.cos(yaw)
+        camera.lookat[1] = robot_pos[1] + look_dist * math.sin(yaw)
+        camera.lookat[2] = robot_pos[2] + 0.5  # Look at shelf height
+
+        camera.distance = look_dist
+        camera.azimuth = math.degrees(yaw) + 180  # Face forward
+        camera.elevation = -15  # Slight downward angle toward shelves
+
+        renderer.update_scene(self.data, camera)
+        frame = renderer.render()
+        renderer.close()
+        return frame
+
+    def render_robot_view_jpeg(self, width: int = 640, height: int = 480) -> bytes | None:
+        """Render robot's view as JPEG bytes (ready for VLM)."""
+        frame = self.render_robot_view(width, height)
+        if frame is None:
+            return None
+        import cv2
+        _, jpeg = cv2.imencode(".jpg", frame[:, :, ::-1])  # RGB → BGR for cv2
+        return jpeg.tobytes()
+
     def reset(self) -> None:
         """Reset the environment to initial state."""
         if self.model is not None:

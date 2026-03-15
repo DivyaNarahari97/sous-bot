@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -163,9 +164,10 @@ def match_to_store(ingredients: list[dict]) -> list[ShoppingItem]:
 class GroceryViewer:
     """Interactive GLFW viewer for the grocery sim."""
 
-    def __init__(self, env: GroceryStoreEnv, items: list[ShoppingItem]) -> None:
+    def __init__(self, env: GroceryStoreEnv, items: list[ShoppingItem], use_vision: bool = True) -> None:
         self.env = env
         self.items = items
+        self._use_vision = use_vision
 
         # MuJoCo rendering objects
         self.scene = mujoco.MjvScene(env.model, maxgeom=5000)
@@ -198,6 +200,10 @@ class GroceryViewer:
         self._log_lines: list[str] = []
         self._pick_notification: str = ""
         self._pick_notification_time: float = 0.0
+
+        # Robot camera (PiP)
+        self._robot_camera = mujoco.MjvCamera()
+        self._robot_scene = mujoco.MjvScene(env.model, maxgeom=5000)
 
     def _mouse_button_callback(self, window, button, act, mods):
         self._button_left = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
@@ -275,7 +281,7 @@ class GroceryViewer:
         self._log(f"Starting shopping run for {len(self.items)} items")
 
         def _run():
-            adapter = SimulationAdapter(env=self.env)
+            adapter = SimulationAdapter(env=self.env, use_vision=self._use_vision)
             adapter._ready = True
             controller = RobotController(adapter=adapter)
 
@@ -365,6 +371,36 @@ class GroceryViewer:
             )
             mujoco.mjr_render(self.viewport, self.scene, self.context)
 
+            # ── Robot camera PiP (bottom-right) ──
+            pip_w, pip_h = fb_width // 4, fb_height // 4
+            pip_viewport = mujoco.MjrRect(fb_width - pip_w - 10, 10, pip_w, pip_h)
+
+            # Update robot camera to follow robot's head
+            robot_pos = self.env.get_robot_position()
+            w, x, y, z = (self.env.data.qpos[3], self.env.data.qpos[4],
+                           self.env.data.qpos[5], self.env.data.qpos[6])
+            yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+            look_dist = 1.5
+            self._robot_camera.lookat[0] = robot_pos[0] + look_dist * math.cos(yaw)
+            self._robot_camera.lookat[1] = robot_pos[1] + look_dist * math.sin(yaw)
+            self._robot_camera.lookat[2] = robot_pos[2] + 0.5
+            self._robot_camera.distance = look_dist
+            self._robot_camera.azimuth = math.degrees(yaw) + 180
+            self._robot_camera.elevation = -15
+
+            mujoco.mjv_updateScene(
+                self.env.model, self.env.data, self.option, None,
+                self._robot_camera, mujoco.mjtCatBit.mjCAT_ALL, self._robot_scene,
+            )
+            mujoco.mjr_render(pip_viewport, self._robot_scene, self.context)
+
+            # PiP label
+            mujoco.mjr_overlay(
+                mujoco.mjtFont.mjFONT_NORMAL, mujoco.mjtGridPos.mjGRID_TOPLEFT,
+                pip_viewport, "ROBOT CAM", "", self.context,
+            )
+
             # ── On-screen overlays ──
 
             # Bottom-left: status + action log
@@ -417,6 +453,8 @@ def main():
                         help="Directly specify item names (skip LLM)")
     parser.add_argument("--skip-llm", action="store_true",
                         help="Use demo shopping list instead of LLM")
+    parser.add_argument("--no-vision", action="store_true",
+                        help="Disable VLM shelf scanning (use lookup only)")
     args = parser.parse_args()
 
     if args.items:
@@ -468,7 +506,10 @@ def main():
     env = GroceryStoreEnv()
     env.load()
 
-    viewer = GroceryViewer(env, items)
+    use_vision = not args.no_vision
+    if use_vision:
+        print("VLM vision enabled — robot will use Qwen2.5-VL to scan shelves\n")
+    viewer = GroceryViewer(env, items, use_vision=use_vision)
     viewer.run()
 
 
