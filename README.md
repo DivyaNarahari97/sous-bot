@@ -4,6 +4,8 @@
 
 Sous Bot scans your kitchen, understands your meal plan, figures out what's missing, and helps you shop — powered by a Unitree G1 humanoid robot.
 
+![Sous Bot Simulation Demo](demo.png)
+
 ## Architecture
 
 ```
