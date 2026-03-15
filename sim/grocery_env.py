@@ -74,7 +74,7 @@ _SHELF_Z = {0: 0.42, 1: 0.77, 2: 1.12}
 def _shelf_pos(aisle_x: float, side: str, shelf: int, offset: float = 0.0) -> tuple:
     """Compute item position on a shelf. offset spreads items along x."""
     y = 1.8 if side == "left" else -1.8
-    return (aisle_x + offset, y, _SHELF_Z[shelf])
+    return (aisle_x + offset * 1.6, y, _SHELF_Z[shelf])
 
 STORE_ITEMS: dict[str, dict] = {
     # ═══ PRODUCE AISLE (x=1.0) — fresh fruits, vegetables, oils ═══
@@ -247,8 +247,24 @@ CHECKOUT_POSITION = (7.0, 0.0)
 ENTRANCE_POSITION = (0.0, 0.0)
 
 
+# Path to textures directory
+_TEXTURE_DIR = os.path.join(os.path.dirname(__file__), "textures")
+
+
 def _build_grocery_store_xml() -> str:
     """Generate MuJoCo XML for grocery store + real Unitree G1 robot."""
+
+    # Build texture and material definitions for all items
+    # Use type="2d" textures on box geoms for product images
+    textures_xml = ""
+    materials_xml = ""
+    for item_name in STORE_ITEMS.keys():
+        safe_name = item_name.replace(" ", "_")
+        tex_path = os.path.join(_TEXTURE_DIR, f"{safe_name}.png")
+        if os.path.exists(tex_path):
+            textures_xml += f'        <texture type="2d" name="tex_{safe_name}" file="{tex_path}" />\n'
+            materials_xml += f'        <material name="mat_{safe_name}" texture="tex_{safe_name}" texrepeat="1 1" />\n'
+
     shelves_xml = ""
     # Shelf dimensions: back panel + 3 horizontal shelf boards
     # Back panel: tall and thin. Shelves: wide platforms extending toward the aisle.
@@ -257,24 +273,24 @@ def _build_grocery_store_xml() -> str:
         shelves_xml += f"""
         <body name="shelf_{aisle_name}_left" pos="{ax} {ay + 2.0} 0">
             <!-- Back panel -->
-            <geom type="box" size="0.5 0.05 0.7" pos="0 0.05 0.7" rgba="0.55 0.35 0.18 1" />
+            <geom type="box" size="0.85 0.05 0.7" pos="0 0.05 0.7" rgba="0.55 0.35 0.18 1" />
             <!-- Bottom shelf -->
-            <geom type="box" size="0.5 0.2 0.015" pos="0 -0.1 {_SHELF_Z[0] - 0.06}" rgba="0.65 0.45 0.25 1" />
+            <geom type="box" size="0.85 0.2 0.015" pos="0 -0.1 {_SHELF_Z[0] - 0.06}" rgba="0.65 0.45 0.25 1" />
             <!-- Middle shelf -->
-            <geom type="box" size="0.5 0.2 0.015" pos="0 -0.1 {_SHELF_Z[1] - 0.06}" rgba="0.65 0.45 0.25 1" />
+            <geom type="box" size="0.85 0.2 0.015" pos="0 -0.1 {_SHELF_Z[1] - 0.06}" rgba="0.65 0.45 0.25 1" />
             <!-- Top shelf -->
-            <geom type="box" size="0.5 0.2 0.015" pos="0 -0.1 {_SHELF_Z[2] - 0.06}" rgba="0.65 0.45 0.25 1" />
+            <geom type="box" size="0.85 0.2 0.015" pos="0 -0.1 {_SHELF_Z[2] - 0.06}" rgba="0.65 0.45 0.25 1" />
         </body>
         <!-- Right shelf (at y = aisle_y - 2.0, items face toward y-positive / aisle center) -->
         <body name="shelf_{aisle_name}_right" pos="{ax} {ay - 2.0} 0">
             <!-- Back panel -->
-            <geom type="box" size="0.5 0.05 0.7" pos="0 -0.05 0.7" rgba="0.55 0.35 0.18 1" />
+            <geom type="box" size="0.85 0.05 0.7" pos="0 -0.05 0.7" rgba="0.55 0.35 0.18 1" />
             <!-- Bottom shelf -->
-            <geom type="box" size="0.5 0.2 0.015" pos="0 0.1 {_SHELF_Z[0] - 0.06}" rgba="0.65 0.45 0.25 1" />
+            <geom type="box" size="0.85 0.2 0.015" pos="0 0.1 {_SHELF_Z[0] - 0.06}" rgba="0.65 0.45 0.25 1" />
             <!-- Middle shelf -->
-            <geom type="box" size="0.5 0.2 0.015" pos="0 0.1 {_SHELF_Z[1] - 0.06}" rgba="0.65 0.45 0.25 1" />
+            <geom type="box" size="0.85 0.2 0.015" pos="0 0.1 {_SHELF_Z[1] - 0.06}" rgba="0.65 0.45 0.25 1" />
             <!-- Top shelf -->
-            <geom type="box" size="0.5 0.2 0.015" pos="0 0.1 {_SHELF_Z[2] - 0.06}" rgba="0.65 0.45 0.25 1" />
+            <geom type="box" size="0.85 0.2 0.015" pos="0 0.1 {_SHELF_Z[2] - 0.06}" rgba="0.65 0.45 0.25 1" />
         </body>"""
 
     items_xml = ""
@@ -402,20 +418,34 @@ def _build_grocery_store_xml() -> str:
         safe_name = item_name.replace(" ", "_")
         vis = item_visuals.get(item_name, _default_vis)
         side = info.get("side", "left")
+
+        # Check if texture exists — use flat 2D plane with image
+        tex_path = os.path.join(_TEXTURE_DIR, f"{safe_name}.png")
+        has_texture = os.path.exists(tex_path)
+
+        if has_texture:
+            # Flat box with texture — rotated so the large face (XY plane) faces the aisle
+            # The box is 8cm x 8cm x 2mm. We rotate 90° around X so the flat face
+            # (originally top/bottom = XY plane) now faces along Y (toward the aisle).
+            # euler="1.5708 0 0" rotates 90° around X-axis
+            geom_attr = f'type="box" size="0.12 0.12 0.002" material="mat_{safe_name}" euler="1.5708 0 0"'
+        else:
+            geom_attr = f'type="{vis["type"]}" size="{vis["size"]}" rgba="{vis["rgba"]}"'
+
         # The pickable item (front of shelf, facing the aisle)
         items_xml += f"""
         <body name="item_{safe_name}" pos="{ix} {iy} {iz}">
-            <geom type="{vis['type']}" size="{vis['size']}" rgba="{vis['rgba']}" contype="0" conaffinity="0" />
+            <geom {geom_attr} contype="0" conaffinity="0" />
         </body>"""
+
         # Stock duplicates behind the pickable item (deeper into the shelf)
-        # This makes shelves look full — 2 copies stacked behind
         dy_back = 0.08 if side == "left" else -0.08
         for depth in range(1, 3):
             stock_id += 1
             sy = iy + dy_back * depth
             items_xml += f"""
         <body name="stock_{stock_id}" pos="{ix} {sy} {iz}">
-            <geom type="{vis['type']}" size="{vis['size']}" rgba="{vis['rgba']}" />
+            <geom {geom_attr} />
         </body>"""
 
     return f"""<?xml version="1.0" ?>
@@ -436,7 +466,7 @@ def _build_grocery_store_xml() -> str:
                  rgb1="0.9 0.9 0.9" rgb2="0.8 0.8 0.8"
                  width="300" height="300" />
         <material name="floor_mat" texture="grid" texrepeat="8 8" reflectance="0.2" />
-    </asset>
+{textures_xml}{materials_xml}    </asset>
 
     <worldbody>
         <!-- Floor -->

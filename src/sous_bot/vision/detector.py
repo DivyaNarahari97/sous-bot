@@ -137,8 +137,8 @@ class IngredientDetector:
         return LocateResult(
             found=bool(data.get("found", False)),
             item_name=item_name,
-            pixel_x=int(data.get("pixel_x", -1)),
-            pixel_y=int(data.get("pixel_y", -1)),
+            pixel_x=int(data.get("pixel_x") or -1),
+            pixel_y=int(data.get("pixel_y") or -1),
             position=str(data.get("position", "")),
             confidence=float(data.get("confidence", 0.0)),
             description=str(data.get("description", "")),
