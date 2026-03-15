@@ -24,12 +24,34 @@ class DetectionResult(BaseModel):
     raw_response: str = ""
 
 
+class LocateResult(BaseModel):
+    """Result of locating a specific item on a store shelf."""
+
+    found: bool = False
+    item_name: str = ""
+    position: str = ""  # e.g. "top-left", "middle-center", "bottom-right"
+    confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    description: str = ""
+    raw_response: str = ""
+
+
 VISION_PROMPT = (
     "You are a pantry inventory assistant. Analyze this image and identify all "
     "visible food ingredients, groceries, and pantry items. Return a JSON array "
     "where each element has 'name' (string, lowercase) and 'confidence' (float "
     "0-1). Only include items you can clearly identify. Example: "
     '[{"name": "milk", "confidence": 0.95}, {"name": "eggs", "confidence": 0.9}]'
+)
+
+SHELF_LOCATE_PROMPT = (
+    "You are a grocery store shelf scanner for an assistive robot. "
+    "Look at this shelf image and find the item: '{item_name}'. "
+    "Return a JSON object with: "
+    "'found' (bool), 'position' (string: top-left/top-center/top-right/"
+    "middle-left/middle-center/middle-right/bottom-left/bottom-center/bottom-right), "
+    "'confidence' (float 0-1), 'description' (brief visual description of the item). "
+    'Example: {{"found": true, "position": "middle-left", "confidence": 0.92, '
+    '"description": "red box of pasta on second shelf"}}'
 )
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.7
@@ -60,6 +82,56 @@ class IngredientDetector:
         """Detect ingredients from an image file path."""
         with open(path, "rb") as f:
             return self.detect_from_bytes(f.read())
+
+    def locate_item_on_shelf(
+        self, image_bytes: bytes, item_name: str
+    ) -> LocateResult:
+        """Locate a specific item on a grocery shelf image (robot's eyes)."""
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_url = f"data:image/jpeg;base64,{b64}"
+        prompt = SHELF_LOCATE_PROMPT.format(item_name=item_name)
+
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        },
+                    ],
+                }
+            ],
+            max_tokens=512,
+        )
+        raw = response.choices[0].message.content or ""
+        return self._parse_locate_response(raw, item_name)
+
+    def _parse_locate_response(self, raw: str, item_name: str) -> LocateResult:
+        """Parse the shelf locate JSON response."""
+        text = raw.strip()
+        # Extract JSON object from possible markdown wrapping
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1:
+            return LocateResult(item_name=item_name, raw_response=raw)
+
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return LocateResult(item_name=item_name, raw_response=raw)
+
+        return LocateResult(
+            found=bool(data.get("found", False)),
+            item_name=item_name,
+            position=str(data.get("position", "")),
+            confidence=float(data.get("confidence", 0.0)),
+            description=str(data.get("description", "")),
+            raw_response=raw,
+        )
 
     def _call_vision(self, image_url: str) -> DetectionResult:
         """Send image to vision LLM and parse response."""
