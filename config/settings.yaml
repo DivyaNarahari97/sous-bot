@@ -1,0 +1,22 @@
+# Sous-Bot Configuration
+# API keys should be set in .env, not here
+
+planner:
+  model: "claude-sonnet-4-20250514"
+  temperature: 0.3
+  max_tokens: 4096
+
+vision:
+  camera_index: 0
+  detection_confidence_threshold: 0.7
+  model: "yolov8n"  # or huggingface model ID
+
+robotics:
+  adapter: "simulation"  # "simulation" or "real"
+  action_timeout_seconds: 30
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:3000"
