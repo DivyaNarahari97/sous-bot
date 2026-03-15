@@ -56,9 +56,29 @@ pantry-pilot/
 
 ## Quick Start
 
+### Prerequisites
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) package manager
+
+### Setup
+
 ```bash
-pip install -r requirements.txt
-python src/app.py
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone the repo
+git clone https://github.com/DivyaNarahari97/sous-bot.git
+cd sous-bot
+
+# Install dependencies
+uv sync
+
+# Copy env file and add your API keys
+cp .env.example .env
+
+# Run the app
+uv run python src/app.py
 ```
 
 ## Team
